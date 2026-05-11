@@ -2,38 +2,39 @@
  * render/particles.js
  * ===================
  * 
- * 粒子动画模拟器 (CPU 实现)。
+ * 粒子模拟器 (Step 4.1 - 带拖尾历史)。
  * 
- * 输入: u/v 矢量场 (来自 PNG 解码) + 网格边界
- * 输出: 每帧的"线段列表"和"头部点列表",喂给 DeckGL LineLayer/ScatterplotLayer
- * 
- * 算法:
- *   - 双线性插值采样 u/v
- *   - 欧拉积分推进粒子位置
- *   - 边界外或速度过小时重置粒子
- *   - 用 cos(lat) 修正经度方向的米→度换算
- * 
- * 性能:
- *   - 1400 粒子 60fps 在桌面 Chrome 上完全没压力
- *   - 阶段 4 会用 WebGL shader 换成 GPU 版本,粒子数可上万
+ * 相对前一版本的改变:
+ * - 每个粒子保留最近 TRAIL_LENGTH 步的位置历史
+ * - step() 输出"分段列表" segments[]: 每段一对 [lon, lat] + 颜色 + alpha
+ * - 重生时清空 history,避免出现"瞬移线段"
  */
 
 
+// 拖尾保留多少步.
+// 在 60fps 下: 40 步 ≈ 0.67 秒视觉残影,搭配 3500× speedFactor
+// 在 zoom=7-9 地图上能看见明显的丝带状拖尾。
+const TRAIL_LENGTH = 40;
+
+// 生命周期淡入淡出 (单位: tick)
+// 粒子的 alpha 因子曲线:
+//   age 0..FADE_IN_FRAMES: alpha 0→1 (诞生)
+//   FADE_IN_FRAMES..maxAge-FADE_OUT_FRAMES: alpha=1 (成熟期)
+//   maxAge-FADE_OUT_FRAMES..maxAge: alpha 1→0 (消亡)
+// FADE_OUT 比 FADE_IN 长很多, 让消亡过程足够"温柔",每帧 alpha 变化 < 3%
+const FADE_IN_FRAMES = 10;
+const FADE_OUT_FRAMES = 40;
+
+
 // ============================================================
-// 单点采样: 在 u/v 网格上做双线性插值
+// 单点采样 (双线性插值)
 // ============================================================
-/**
- * 在 ROMS 原始网格 (nEta × nXi) 上采样 u/v。
- * 用经纬度等距近似 (对 Perth 域 < 1° 跨度误差 <0.1%, 视觉无差异)。
- */
 function sampleUV(u, v, mask, nEta, nXi, bounds, lon, lat) {
-  // 边界检查
   if (lon < bounds.minLon || lon > bounds.maxLon ||
       lat < bounds.minLat || lat > bounds.maxLat) {
     return null;
   }
   
-  // 浮点网格坐标
   const fx = (lon - bounds.minLon) / (bounds.maxLon - bounds.minLon) * (nXi - 1);
   const fy = (lat - bounds.minLat) / (bounds.maxLat - bounds.minLat) * (nEta - 1);
   
@@ -42,86 +43,80 @@ function sampleUV(u, v, mask, nEta, nXi, bounds, lon, lat) {
   const x1 = Math.min(x0 + 1, nXi - 1);
   const y1 = Math.min(y0 + 1, nEta - 1);
   
-  if (x0 < 0 || x0 >= nXi - 1 || y0 < 0 || y0 >= nEta - 1) {
-    return null;
-  }
+  if (x0 < 0 || x0 >= nXi - 1 || y0 < 0 || y0 >= nEta - 1) return null;
   
   const tx = fx - x0;
   const ty = fy - y0;
   
-  // 4 个角点的扁平索引
   const i00 = y0 * nXi + x0;
   const i10 = y0 * nXi + x1;
   const i01 = y1 * nXi + x0;
   const i11 = y1 * nXi + x1;
   
-  // 检查 4 个角点都是海洋
   if (mask[i00] === 0 || mask[i10] === 0 ||
-      mask[i01] === 0 || mask[i11] === 0) {
-    return null;
-  }
+      mask[i01] === 0 || mask[i11] === 0) return null;
   
-  // 双线性插值
   const u00 = u[i00], u10 = u[i10], u01 = u[i01], u11 = u[i11];
   const v00 = v[i00], v10 = v[i10], v01 = v[i01], v11 = v[i11];
   
   if (!Number.isFinite(u00) || !Number.isFinite(u10) ||
-      !Number.isFinite(u01) || !Number.isFinite(u11)) {
-    return null;
-  }
+      !Number.isFinite(u01) || !Number.isFinite(u11)) return null;
   
   const u0 = u00 * (1 - tx) + u10 * tx;
   const u1 = u01 * (1 - tx) + u11 * tx;
   const v0 = v00 * (1 - tx) + v10 * tx;
   const v1 = v01 * (1 - tx) + v11 * tx;
   
-  const uVal = u0 * (1 - ty) + u1 * ty;
-  const vVal = v0 * (1 - ty) + v1 * ty;
-  
-  return { u: uVal, v: vVal };
+  return {
+    u: u0 * (1 - ty) + u1 * ty,
+    v: v0 * (1 - ty) + v1 * ty,
+  };
 }
 
 
 // ============================================================
-// 在有效海洋点上随机生成一个粒子
+// 重生
 // ============================================================
 function spawnParticle(uvFrame, bounds) {
   const { u, v, mask, nEta, nXi } = uvFrame;
   
-  // 尝试 60 次找到一个有效采样点
   for (let attempt = 0; attempt < 60; attempt++) {
     const row = Math.floor(Math.random() * nEta);
     const col = Math.floor(Math.random() * nXi);
     const idx = row * nXi + col;
     
     if (mask[idx] === 1 && Number.isFinite(u[idx]) && Number.isFinite(v[idx])) {
-      // 网格索引 -> 经纬度
       const lon = bounds.minLon + (col / (nXi - 1)) * (bounds.maxLon - bounds.minLon);
       const lat = bounds.minLat + (row / (nEta - 1)) * (bounds.maxLat - bounds.minLat);
-      return { lon, lat, prevLon: lon, prevLat: lat, age: 0 };
+      return {
+        lon, lat,
+        history: [],
+        age: 0,
+        lastSpeed: 0,
+        lastU: 0,
+        lastV: 0,
+      };
     }
   }
   
-  // 兜底: 域内随机位置 (可能落在陆地, 但下一帧会被重置)
   const lon = bounds.minLon + Math.random() * (bounds.maxLon - bounds.minLon);
   const lat = bounds.minLat + Math.random() * (bounds.maxLat - bounds.minLat);
-  return { lon, lat, prevLon: lon, prevLat: lat, age: 0 };
+  return { lon, lat, history: [], age: 0, lastSpeed: 0, lastU: 0, lastV: 0 };
 }
 
 
 // ============================================================
-// 粒子配色: 流速大小映射到颜色
+// 速度 → RGB (alpha 由调用方根据段位置计算)
 // ============================================================
-function speedToColor(speed, alpha = 200) {
-  const t = Math.max(0, Math.min(1, speed / 1.0));  // 0-1 m/s 映射到 0-1
+function speedToRGB(speed) {
+  const t = Math.max(0, Math.min(1, speed / 1.0));
   
-  // 浅蓝 → 蓝 → 黄 → 橙 → 红
   const stops = [
-    { t: 0.0,  color: [56, 189, 248] },   // 浅蓝
-    { t: 0.35, color: [96, 165, 250] },   // 蓝
-    { t: 0.6,  color: [250, 204, 21] },   // 黄
-    { t: 0.85, color: [251, 146, 60] },   // 橙
-    { t: 1.0,  color: [239, 68, 68] },    // 红
+    { t: 0.0,  c: [56, 189, 248] },
+    { t: 0.35, c: [96, 165, 250] },
+    { t: 0.6,  c: [250, 204, 21] },
+    { t: 0.85, c: [251, 146, 60] },
+    { t: 1.0,  c: [239, 68,  68] },
   ];
   
   for (let i = 0; i < stops.length - 1; i++) {
@@ -129,19 +124,18 @@ function speedToColor(speed, alpha = 200) {
     if (t >= a.t && t <= b.t) {
       const localT = (t - a.t) / (b.t - a.t);
       return [
-        Math.round(a.color[0] + (b.color[0] - a.color[0]) * localT),
-        Math.round(a.color[1] + (b.color[1] - a.color[1]) * localT),
-        Math.round(a.color[2] + (b.color[2] - a.color[2]) * localT),
-        alpha,
+        Math.round(a.c[0] + (b.c[0] - a.c[0]) * localT),
+        Math.round(a.c[1] + (b.c[1] - a.c[1]) * localT),
+        Math.round(a.c[2] + (b.c[2] - a.c[2]) * localT),
       ];
     }
   }
-  return [...stops[stops.length - 1].color, alpha];
+  return stops[stops.length - 1].c;
 }
 
 
 // ============================================================
-// 粒子模拟器: 主类
+// 粒子模拟器
 // ============================================================
 export class ParticleSimulator {
   constructor({ uvFrame, bounds, nParticles = 1400 }) {
@@ -150,26 +144,23 @@ export class ParticleSimulator {
     this.particles = Array.from({ length: nParticles }, () =>
       spawnParticle(uvFrame, bounds)
     );
-    this.maxAge = 80;  // 粒子最多存活 80 帧后重置 (避免长期"堆积"在低流速区)
+    this.maxAge = 180;  // 总寿命: ~3 秒。配合 FADE_OUT=40, 成熟期约 130 帧 (2 秒)
+    this.trailLength = TRAIL_LENGTH;
   }
   
-  // 切换 u/v 帧 (小时变化时), 粒子位置保持
   updateUVFrame(uvFrame) {
     this.uvFrame = uvFrame;
   }
   
-  // 重置所有粒子 (切换日期时)
   reset(uvFrame, bounds) {
     this.uvFrame = uvFrame;
     this.bounds = bounds;
     this.particles = this.particles.map(() => spawnParticle(uvFrame, bounds));
   }
   
-  // 改变粒子总数
   setParticleCount(n) {
     const current = this.particles.length;
     if (n > current) {
-      // 添加新粒子
       for (let i = 0; i < n - current; i++) {
         this.particles.push(spawnParticle(this.uvFrame, this.bounds));
       }
@@ -179,17 +170,12 @@ export class ParticleSimulator {
   }
   
   /**
-   * 推进一步。
-   * 
-   * @param {number} dtSeconds 真实时间 dt (秒)
-   * @param {number} speedFactor 视觉加速因子 (默认 1600, 即 1 秒动画 = 1600 秒物理时间)
-   * @param {number} alpha 0-255
-   * @returns {{ segments: Array, heads: Array }}
-   *   segments: 给 LineLayer 用
-   *   heads:    给 ScatterplotLayer 用
+   * 推进一步。返回:
+   * - segments: 拖尾线段列表 (每段 = 1 对相邻历史点 + 颜色)
+   * - heads: 头部点列表 (每个粒子当前位置)
    */
-  step(dtSeconds, speedFactor, alpha) {
-    const { uvFrame, bounds, particles, maxAge } = this;
+  step(dtSeconds, speedFactor, baseAlpha) {
+    const { uvFrame, bounds, particles, maxAge, trailLength } = this;
     const { u, v, mask, nEta, nXi } = uvFrame;
     
     const simSeconds = dtSeconds * speedFactor;
@@ -199,68 +185,141 @@ export class ParticleSimulator {
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
       
-      // 采样当前位置的 u/v
+      // 已经"死透"了 (age 超过 maxAge): 真正重生
+      if (p.age >= maxAge) {
+        const np = spawnParticle(uvFrame, bounds);
+        p.lon = np.lon; p.lat = np.lat;
+        p.history = []; p.age = 0; p.lastSpeed = 0;
+        p.lastU = 0; p.lastV = 0;
+        continue;
+      }
+      
       const sampled = sampleUV(u, v, mask, nEta, nXi, bounds, p.lon, p.lat);
+      
+      // 判断当前是否应该处于"加速死亡"状态
+      // 触发条件: 出界, 流速过小, 或即将出界
+      let triggerDying = false;
+      let canMove = false;     // 这一帧能正常移动吗?
+      let curU = 0, curV = 0;  // 这一帧要用的 u/v
+      
       if (!sampled) {
-        // 在陆地/边界外, 重生
-        const newP = spawnParticle(uvFrame, bounds);
-        p.lon = newP.lon; p.lat = newP.lat;
-        p.prevLon = newP.prevLon; p.prevLat = newP.prevLat;
-        p.age = 0;
-        continue;
+        triggerDying = true;
+      } else {
+        const speed = Math.sqrt(sampled.u * sampled.u + sampled.v * sampled.v);
+        if (speed < 0.005) {
+          triggerDying = true;
+        } else {
+          const cosLat = Math.max(Math.cos((p.lat * Math.PI) / 180), 0.2);
+          const dLat = (sampled.v * simSeconds) / 111320;
+          const dLon = (sampled.u * simSeconds) / (111320 * cosLat);
+          const newLon = p.lon + dLon;
+          const newLat = p.lat + dLat;
+          
+          if (newLon < bounds.minLon || newLon > bounds.maxLon ||
+              newLat < bounds.minLat || newLat > bounds.maxLat) {
+            // 即将出界: 触发 dying, 但本帧依然按这个方向推进 (漂出去)
+            triggerDying = true;
+            canMove = true;
+            curU = sampled.u; curV = sampled.v;
+            p.lastU = sampled.u; p.lastV = sampled.v;
+            p.lastSpeed = speed;
+          } else {
+            // 一切正常,推进
+            canMove = true;
+            curU = sampled.u; curV = sampled.v;
+            p.lastU = sampled.u; p.lastV = sampled.v;
+            p.lastSpeed = speed;
+          }
+        }
       }
       
-      const speed = Math.sqrt(sampled.u * sampled.u + sampled.v * sampled.v);
-      
-      // 速度过小或粒子寿命到, 重生
-      if (speed < 0.005 || p.age >= maxAge) {
-        const newP = spawnParticle(uvFrame, bounds);
-        p.lon = newP.lon; p.lat = newP.lat;
-        p.prevLon = newP.prevLon; p.prevLat = newP.prevLat;
-        p.age = 0;
-        continue;
+      // 触发 dying: 把 age 推到 maxAge - FADE_OUT_FRAMES
+      if (triggerDying && p.age < maxAge - FADE_OUT_FRAMES) {
+        p.age = maxAge - FADE_OUT_FRAMES;
       }
       
-      // 欧拉积分: 球面近似, 用 cos(lat) 修正经度方向
-      const cosLat = Math.max(Math.cos((p.lat * Math.PI) / 180), 0.2);
-      const dLat = (sampled.v * simSeconds) / 111320;
-      const dLon = (sampled.u * simSeconds) / (111320 * cosLat);
-      
-      const newLon = p.lon + dLon;
-      const newLat = p.lat + dLat;
-      
-      // 边界外, 重生
-      if (newLon < bounds.minLon || newLon > bounds.maxLon ||
-          newLat < bounds.minLat || newLat > bounds.maxLat) {
-        const newP = spawnParticle(uvFrame, bounds);
-        p.lon = newP.lon; p.lat = newP.lat;
-        p.prevLon = newP.prevLon; p.prevLat = newP.prevLat;
-        p.age = 0;
-        continue;
+      // ⭐ 关键: dying 状态如果 canMove=false (例如出界后陆地上),
+      // 用上次记录的 lastU/lastV 让粒子继续漂动,
+      // 这样头部点不静止,丝带会和健康粒子一样"流出画面"
+      if (triggerDying && !canMove && (p.lastU !== 0 || p.lastV !== 0)) {
+        canMove = true;
+        curU = p.lastU; curV = p.lastV;
+        // dying 时速度衰减一点点 (每帧 ×0.96), 看起来像"减速消失"
+        p.lastU *= 0.96; p.lastV *= 0.96;
       }
       
-      // 更新位置
-      p.prevLon = p.lon;
-      p.prevLat = p.lat;
-      p.lon = newLon;
-      p.lat = newLat;
+      // 实际推进
+      if (canMove) {
+        const cosLat = Math.max(Math.cos((p.lat * Math.PI) / 180), 0.2);
+        const dLat = (curV * simSeconds) / 111320;
+        const dLon = (curU * simSeconds) / (111320 * cosLat);
+        const newLon = p.lon + dLon;
+        const newLat = p.lat + dLat;
+        
+        // 健康粒子: 推 history + 移动
+        // dying + 出界粒子: 也可以正常推 (反正快消失了)
+        p.history.push([p.lon, p.lat]);
+        if (p.history.length > trailLength) p.history.shift();
+        p.lon = newLon;
+        p.lat = newLat;
+      }
+      
       p.age++;
       
-      // 输出渲染数据
-      const color = speedToColor(speed, alpha);
-      const width = Math.min(2.2, 0.8 + speed * 0.9);
+      // ----- 计算生命周期 alpha 因子 -----
+      let lifeAlpha = 1.0;
+      if (p.age < FADE_IN_FRAMES) {
+        // 淡入: 0..1
+        lifeAlpha = p.age / FADE_IN_FRAMES;
+      } else if (p.age > maxAge - FADE_OUT_FRAMES) {
+        // 淡出: 1..0
+        const remaining = maxAge - p.age;
+        lifeAlpha = Math.max(0, remaining / FADE_OUT_FRAMES);
+      }
+      // 平滑曲线 (smoothstep): 让淡入淡出更柔和,避免线性看起来"硬"
+      lifeAlpha = lifeAlpha * lifeAlpha * (3 - 2 * lifeAlpha);
       
-      segments.push({
-        sourcePosition: [p.prevLon, p.prevLat],
-        targetPosition: [p.lon, p.lat],
-        color,
-        width,
-      });
+      // 完全透明的粒子跳过渲染
+      if (lifeAlpha < 0.02) continue;
       
+      // ----- 生成渲染数据 -----
+      const speed = p.lastSpeed;
+      const rgb = speedToRGB(speed);
+      const widthHead = Math.min(2.0, 0.8 + speed * 0.7);
+      
+      const hist = p.history;
+      const histLen = hist.length;
+      
+      if (histLen >= 1) {
+        // ⭐ 简化逻辑: 不再"逐段吃掉",所有段都画出来,
+        // 但每段 alpha 都乘以 lifeAlpha (整条丝带统一淡入淡出)
+        // 这样消失过程是 alpha 平滑下降, 没有段数离散变化的"啪"。
+        for (let s = 0; s < histLen; s++) {
+          const t = (s + 1) / histLen;
+          const trailAlpha = t * t;
+          
+          // 段 alpha = baseAlpha × 拖尾位置因子 × 生命周期因子
+          const alpha = Math.round(baseAlpha * trailAlpha * lifeAlpha);
+          
+          const start = hist[s];
+          const end = (s + 1 < histLen) ? hist[s + 1] : [p.lon, p.lat];
+          
+          if (alpha < 2) continue;  // alpha 极小才跳过
+          
+          segments.push({
+            sourcePosition: start,
+            targetPosition: end,
+            color: [rgb[0], rgb[1], rgb[2], alpha],
+            width: widthHead * (0.5 + 0.5 * t),
+          });
+        }
+      }
+      
+      // 头部点跟 lifeAlpha 同步淡入淡出
       heads.push({
         position: [p.lon, p.lat],
-        color,
-        radius: Math.min(2.8, 1.0 + speed * 1.2),
+        color: [rgb[0], rgb[1], rgb[2], Math.round(baseAlpha * lifeAlpha)],
+        radius: Math.min(2.6, 0.9 + speed * 1.0),
       });
     }
     

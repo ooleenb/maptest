@@ -2,17 +2,11 @@
  * render/scalarLayer.js
  * =====================
  * 
- * 把"网格 polygons + 一帧标量场数据"组装成 DeckGL PolygonLayer。
+ * Step 3.3 改造: 支持时间维度的双线性插值。
  * 
- * 设计:
- * - 输入: 网格 (oceanCells) + 数据帧 (Float32Array) + 配色范围
- * - 输出: 可直接放进 DeckGL <DeckGL layers={[...]}> 的 Layer 实例
- * - 内部预先把每个 cell 染色 (一次性,不在 DeckGL 每帧重算)
- * 
- * 性能关键:
- * - 用 oceanCells (已过滤的海洋格子,~25000 个) 而不是全网格 33411 个
- * - 数据是 Float32Array 扁平化的,索引访问 O(1)
- * - 染色逻辑在 JS 跑,不在 GPU——这样切换 colormap/范围都是 CPU 操作,响应快
+ * 旧版: hourIndex 是整数, 直接用 frame[i]
+ * 新版: hourFloat 是浮点, frame = lerp(frame[floor(t)], frame[ceil(t)], frac(t))
+ *       这样时间滑块拖动时颜色平滑过渡, 不再"逐小时跳"
  */
 
 import { PolygonLayer } from "@deck.gl/layers";
@@ -20,16 +14,47 @@ import { valueToRGBA } from "./colormaps.js";
 
 
 /**
- * 把 oceanCells 和当前帧数据合并成"带颜色的 polygon 列表"。
+ * 在时间维度做双线性插值, 返回一个 Float32Array (代表"虚拟的"该时刻数据)。
  * 
- * @param {Array} oceanCells          来自 grid.json 的海洋格子
- * @param {Float32Array} frameData    当前帧的标量值 (扁平,长度 nEta*nXi)
- * @param {number} nXi                网格列数 (用于 2D 索引)
- * @param {number} colorMin           配色下限
- * @param {number} colorMax           配色上限
- * @param {function} cmap             colormap 函数
- * @param {number} alpha              0-255
- * @returns {Array<{polygon, color, value, row, col}>}
+ * @param {object} scalar  decoded scalar (来自 decoder.js)
+ * @param {number} hourFloat  浮点小时索引, 例如 13.4
+ * @returns {Float32Array} 插值后的帧数据
+ */
+export function interpolateFrame(scalar, hourFloat) {
+  const { nFrames, frameSize } = scalar;
+  
+  // 边界处理
+  if (hourFloat <= 0) return scalar.getFrame(0);
+  if (hourFloat >= nFrames - 1) return scalar.getFrame(nFrames - 1);
+  
+  const iLow = Math.floor(hourFloat);
+  const iHigh = iLow + 1;
+  const frac = hourFloat - iLow;
+  
+  // 整数时直接返回视图,零拷贝
+  if (frac < 1e-6) return scalar.getFrame(iLow);
+  
+  const frameLow = scalar.getFrame(iLow);
+  const frameHigh = scalar.getFrame(iHigh);
+  
+  // 插值需要新分配数组
+  const result = new Float32Array(frameSize);
+  for (let i = 0; i < frameSize; i++) {
+    const a = frameLow[i];
+    const b = frameHigh[i];
+    // 任一为 NaN 则结果 NaN (陆地)
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      result[i] = NaN;
+    } else {
+      result[i] = a * (1 - frac) + b * frac;
+    }
+  }
+  return result;
+}
+
+
+/**
+ * 把 oceanCells 和当前帧数据合并成"带颜色的 polygon 列表"。
  */
 export function buildColoredCells(
   oceanCells,
@@ -61,15 +86,28 @@ export function buildColoredCells(
 
 
 /**
- * 创建 DeckGL PolygonLayer。
- * 
- * @param {object} params
- * @param {string} params.id                Layer ID (用于 DeckGL diff)
- * @param {Array} params.coloredCells       buildColoredCells 的输出
- * @param {number} params.timeIndex         小时索引 (用于 updateTriggers)
- * @returns {PolygonLayer}
+ * 计算"当前帧"的 min/max (用于 "Hour" 颜色范围模式)
  */
-export function createScalarLayer({ id, coloredCells, timeIndex }) {
+export function computeFrameMinMax(frameData) {
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < frameData.length; i++) {
+    const v = frameData[i];
+    if (Number.isFinite(v)) {
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    return { min: 0, max: 1 };
+  }
+  return { min, max };
+}
+
+
+/**
+ * 创建 DeckGL PolygonLayer。
+ */
+export function createScalarLayer({ id, coloredCells, updateTriggerKey }) {
   return new PolygonLayer({
     id,
     data: coloredCells,
@@ -82,32 +120,36 @@ export function createScalarLayer({ id, coloredCells, timeIndex }) {
       depthTest: false,
       blend: true,
     },
-    // updateTriggers 告诉 DeckGL: "当 timeIndex 变,重新读 color"
-    // 没这个的话,DeckGL 不会知道数据变了 (因为 data 引用可能没变)
     updateTriggers: {
-      getFillColor: [timeIndex],
+      // 任何颜色相关参数变, 重新读 color
+      getFillColor: [updateTriggerKey],
     },
   });
 }
 
 
 /**
- * 在一帧数据里找最接近 (lon, lat) 的格子的值 (点击采样用)。
+ * 点击采样: 在原始网格上找最近 cell 的值。
  * 
- * 注意: 这是 O(N) 的暴力搜索,对 25000 个 cell 大概 1-2ms,够快。
- * 未来如果要点击采样很频繁,可以加 KD-tree。
+ * 加了距离阈值: 如果点击位置距离最近 cell 超过 maxDistanceDeg 度,
+ * 返回 null (避免点陆地/远海/世界另一边却拿到 Perth 海面值)。
+ * 
+ * Perth 网格分辨率约 500m ≈ 0.005°,
+ * 我们用 0.012° (~1.3 km) 作为阈值: 略大于一个 cell, 但远比
+ * "点到非海洋区域"那种 0.1° 以上的距离要小。
  */
-export function sampleAtPoint(oceanCells, frameData, nXi, lon, lat) {
+export function sampleAtPoint(oceanCells, frameData, nXi, lon, lat, maxDistanceDeg = 0.012) {
   let bestDist = Infinity;
   let bestValue = null;
+  
   for (let i = 0; i < oceanCells.length; i++) {
     const cell = oceanCells[i];
-    // 用 cell 中心作为近似位置
     const cx = (cell.polygon[0][0] + cell.polygon[2][0]) / 2;
     const cy = (cell.polygon[0][1] + cell.polygon[2][1]) / 2;
     const dx = cx - lon;
     const dy = cy - lat;
     const dist = dx * dx + dy * dy;
+    
     if (dist < bestDist) {
       const value = frameData[cell.row * nXi + cell.col];
       if (Number.isFinite(value)) {
@@ -116,5 +158,12 @@ export function sampleAtPoint(oceanCells, frameData, nXi, lon, lat) {
       }
     }
   }
+  
+  // ⭐ 距离阈值检查: 太远就当作无效
+  const maxDistSq = maxDistanceDeg * maxDistanceDeg;
+  if (bestDist > maxDistSq) {
+    return null;
+  }
+  
   return bestValue;
 }

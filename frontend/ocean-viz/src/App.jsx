@@ -1,17 +1,11 @@
 /**
- * App.jsx (Step 3.2c)
- * ===================
+ * App.jsx (Step 3.4)
+ * ==================
  * 
- * 主组件 - 加入变量切换 + 粒子动画。
- * 
- * 新增能力 (相对 3.2b):
- * - 变量切换 (温度 / 盐度 / SSH)
- * - 粒子动画回归 (用新数据层的 u/v PNG)
- * - 粒子可调: 开关、透明度、速度、数量
- * 
- * 留给后续:
- * - Step 3.3: 多 colormap + 时间维度插值
- * - 阶段 4: GPU 粒子 (大幅提升粒子数和性能)
+ * 全新布局: windy.com 风格。
+ * - 顶栏 (44px) + 左侧图标栏 (72px) + 底部时间轴 (54px)
+ * - 设置通过 popover 弹出, 不挤占常驻空间
+ * - 深色主题, 单一强调色
  */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -22,29 +16,39 @@ import "maplibre-gl/dist/maplibre-gl.css";
 
 import { loadGrid, listAvailableDates } from "./data/loader.js";
 import { DEFAULT_SOURCE } from "./data/config.js";
-import { VARIABLE_COLORMAPS } from "./render/colormaps.js";
+import { COLORMAPS, DEFAULT_COLORMAP, VARIABLE_UNITS } from "./render/colormaps.js";
 import {
-  buildColoredCells,
-  createScalarLayer,
-  sampleAtPoint,
+  buildColoredCells, createScalarLayer, sampleAtPoint,
+  interpolateFrame, computeFrameMinMax,
 } from "./render/scalarLayer.js";
 import { ParticleSimulator } from "./render/particles.js";
 import { useDayData } from "./hooks/useDayData.js";
+import { usePlayback } from "./hooks/usePlayback.js";
+
+// UI 组件
+import TopBar from "./components/TopBar.jsx";
+import IconSidebar from "./components/IconSidebar.jsx";
+import BottomTimebar from "./components/BottomTimebar.jsx";
 import LoadingOverlay from "./components/LoadingOverlay.jsx";
 import TopProgressBar from "./components/TopProgressBar.jsx";
-import ControlPanel from "./components/ControlPanel.jsx";
+import PointPopup from "./components/PointPopup.jsx";
+import ColorbarLegend from "./components/ColorbarLegend.jsx";
+import ParticleLegend from "./components/ParticleLegend.jsx";
+
+// Popovers
+import VariablePopover from "./components/popovers/VariablePopover.jsx";
+import ColormapPopover from "./components/popovers/ColormapPopover.jsx";
+import ParticlesPopover from "./components/popovers/ParticlesPopover.jsx";
+import OpacityPopover from "./components/popovers/OpacityPopover.jsx";
+
+import { theme } from "./theme.js";
 
 
-// ============================================================
-// 配置
-// ============================================================
 const INITIAL_DATE = "2026-03-11";
 const SLOW_LOAD_THRESHOLD_MS = 2000;
+const MAX_HOUR = 23;
 
 
-// ============================================================
-// 底图样式
-// ============================================================
 const mapStyle = {
   version: 8,
   sources: {
@@ -61,39 +65,58 @@ const mapStyle = {
 };
 
 
-// ============================================================
-// 主组件
-// ============================================================
 export default function App() {
-  // ---- 顶层状态 ----
+  // ---- 数据 ----
   const [grid, setGrid] = useState(null);
   const [gridError, setGridError] = useState(null);
   const [datesIndex, setDatesIndex] = useState(null);
   
   const [date, setDate] = useState(INITIAL_DATE);
-  const [variable, setVariable] = useState("temp");  // 当前显示的变量
-  const [hourIndex, setHourIndex] = useState(0);
+  const [variable, setVariable] = useState("temp");
+  const [colormapKey, setColormapKey] = useState(DEFAULT_COLORMAP.temp);
+  const [rangeMode, setRangeMode] = useState("global");
   const [opacity, setOpacity] = useState(0.75);
   
-  // 粒子状态
+  // ---- 播放 ----
+  const [playbackSpeed, setPlaybackSpeed] = useState(2);
+  const {
+    hourFloat, setHourFloat,
+    isPlaying, togglePlay, pause,
+  } = usePlayback({ initialHour: 0, maxHour: MAX_HOUR, speed: playbackSpeed });
+  
+  // ---- 粒子 ----
   const [particlesEnabled, setParticlesEnabled] = useState(true);
   const [particleOpacity, setParticleOpacity] = useState(0.8);
-  const [particleSpeed, setParticleSpeed] = useState(1600);
+  const [particleSpeed, setParticleSpeed] = useState(3500);
   const [particleCount, setParticleCount] = useState(1400);
   
+  // ---- UI 状态 ----
+  const [activeSidebar, setActiveSidebar] = useState(null);  // null|'variable'|'colormap'|'particles'|'opacity'
   const [pickedPoint, setPickedPoint] = useState(null);
   const [popupScreenPos, setPopupScreenPos] = useState(null);
   const [showSlowWarning, setShowSlowWarning] = useState(false);
   
-  // 粒子动画输出 (会高频更新)
+  // ---- 粒子动画 ----
   const [particleSegments, setParticleSegments] = useState([]);
   const [particleHeads, setParticleHeads] = useState([]);
+  // ⭐ 通过自增 token 触发动画 effect 重跑 (修复"刷新后粒子不显示"的时序 bug)
+  const [simulatorReadyToken, setSimulatorReadyToken] = useState(0);
   
   const mapRef = useRef(null);
-  const simulatorRef = useRef(null);            // ParticleSimulator 实例
+  const simulatorRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastFrameTimeRef = useRef(null);
   const lastCommitTimeRef = useRef(0);
+  
+  
+  // ============================================================
+  // 切变量时自动应用推荐 colormap
+  // ============================================================
+  useEffect(() => {
+    if (DEFAULT_COLORMAP[variable]) {
+      setColormapKey(DEFAULT_COLORMAP[variable]);
+    }
+  }, [variable]);
   
   
   // ============================================================
@@ -101,7 +124,6 @@ export default function App() {
   // ============================================================
   useEffect(() => {
     let cancelled = false;
-    
     async function loadInitial() {
       try {
         const [gridData, dates] = await Promise.all([
@@ -116,22 +138,16 @@ export default function App() {
         if (!cancelled) setGridError(err.message || String(err));
       }
     }
-    
     loadInitial();
     return () => { cancelled = true; };
   }, []);
   
   
-  // ============================================================
-  // 每日数据
-  // ============================================================
   const dayState = useDayData(grid ? DEFAULT_SOURCE : null, date);
   const day = dayState.data;
   
   
-  // ============================================================
   // 慢加载检测
-  // ============================================================
   useEffect(() => {
     if (!dayState.loading) {
       setShowSlowWarning(false);
@@ -142,35 +158,48 @@ export default function App() {
   }, [dayState.loading]);
   
   
-  // ============================================================
   // 视图: 网格加载完后自动 fit
-  // ============================================================
   useEffect(() => {
     if (!grid || !mapRef.current) return;
     const map = mapRef.current.getMap?.();
     if (!map) return;
-    
     map.fitBounds(
       [
         [grid.bounds.minLon, grid.bounds.minLat],
         [grid.bounds.maxLon, grid.bounds.maxLat],
       ],
-      { padding: 60, duration: 1000 }
+      {
+        padding: {
+          top: theme.topBarHeight + 20,
+          left: theme.sidebarWidth + 20,
+          right: 20,
+          bottom: theme.bottomBarHeight + 20,
+        },
+        duration: 1000,
+      }
     );
   }, [grid]);
   
   
-  // ============================================================
-  // 当前帧的标量场染色 polygon
-  // ============================================================
+  // 当前帧染色
   const coloredCells = useMemo(() => {
     if (!grid || !day) return null;
     
-    const frameData = day.scalars[variable].getFrame(hourIndex);
-    const range = day.ranges[variable];
-    const colorMin = range.p01;
-    const colorMax = range.p99;
-    const cmap = VARIABLE_COLORMAPS[variable];
+    const scalar = day.scalars[variable];
+    const frameData = interpolateFrame(scalar, hourFloat);
+    
+    let colorMin, colorMax;
+    if (rangeMode === "global") {
+      const range = day.ranges[variable];
+      colorMin = range.p01;
+      colorMax = range.p99;
+    } else {
+      const mm = computeFrameMinMax(frameData);
+      colorMin = mm.min;
+      colorMax = mm.max;
+    }
+    
+    const cmap = COLORMAPS[colormapKey] ?? COLORMAPS[DEFAULT_COLORMAP[variable]];
     const alpha = Math.round(255 * opacity);
     
     return {
@@ -180,61 +209,49 @@ export default function App() {
       ),
       colorMin, colorMax, cmap, frameData,
     };
-  }, [grid, day, hourIndex, opacity, variable]);
+  }, [grid, day, hourFloat, opacity, variable, colormapKey, rangeMode]);
   
   
-  // ============================================================
-  // 粒子模拟器: 初始化 / 切日期时重置
-  // ============================================================
+  // 粒子: 初始化 / 切日期时重置
   useEffect(() => {
     if (!grid || !day) {
       simulatorRef.current = null;
       return;
     }
-    
-    const uvFrame = day.uv[hourIndex] ?? day.uv[0];
-    
+    const hourInt = Math.min(Math.floor(hourFloat), day.uv.length - 1);
+    const uvFrame = day.uv[hourInt];
     if (!simulatorRef.current) {
-      // 首次初始化
       simulatorRef.current = new ParticleSimulator({
-        uvFrame,
-        bounds: grid.bounds,
-        nParticles: particleCount,
+        uvFrame, bounds: grid.bounds, nParticles: particleCount,
       });
     } else {
-      // 切日期时重置粒子位置
       simulatorRef.current.reset(uvFrame, grid.bounds);
     }
-  }, [grid, day]);  // 注意: 只在 grid/day 变化时重置, hourIndex 变化时不重置
+    // ⭐ 通知动画 useEffect: simulator 已经就绪 (或刚被重置)
+    setSimulatorReadyToken(t => t + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [grid, day]);
   
   
-  // ============================================================
-  // 粒子模拟器: 跟随 hourIndex 更新 u/v 帧 (不重置位置)
-  // ============================================================
+  // 粒子: 跟随整数小时切换 u/v
   useEffect(() => {
     if (!simulatorRef.current || !day) return;
-    const uvFrame = day.uv[hourIndex];
+    const hourInt = Math.min(Math.floor(hourFloat), day.uv.length - 1);
+    const uvFrame = day.uv[hourInt];
     if (uvFrame) simulatorRef.current.updateUVFrame(uvFrame);
-  }, [hourIndex, day]);
+  }, [hourFloat, day]);
   
-  
-  // ============================================================
-  // 粒子数量变化
-  // ============================================================
   useEffect(() => {
     if (!simulatorRef.current) return;
     simulatorRef.current.setParticleCount(particleCount);
   }, [particleCount]);
   
   
-  // ============================================================
   // 粒子动画循环
-  // ============================================================
   useEffect(() => {
     if (!particlesEnabled || !simulatorRef.current) {
       setParticleSegments([]);
       setParticleHeads([]);
-      // 清理已经在跑的动画
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
@@ -242,53 +259,39 @@ export default function App() {
       lastFrameTimeRef.current = null;
       return;
     }
-    
     const animate = (timestamp) => {
-      if (!lastFrameTimeRef.current) {
-        lastFrameTimeRef.current = timestamp;
-      }
+      if (!lastFrameTimeRef.current) lastFrameTimeRef.current = timestamp;
       const dtReal = Math.min((timestamp - lastFrameTimeRef.current) / 1000, 0.05);
       lastFrameTimeRef.current = timestamp;
-      
       const alpha = Math.round(255 * particleOpacity);
       const { segments, heads } = simulatorRef.current.step(dtReal, particleSpeed, alpha);
-      
-      // 限频提交到 React (避免每帧 setState 太密集)
-      if (timestamp - lastCommitTimeRef.current > 33) {  // ~30 fps
+      if (timestamp - lastCommitTimeRef.current > 16) {  // ~60fps commit (拖尾顺滑)
         setParticleSegments(segments);
         setParticleHeads(heads);
         lastCommitTimeRef.current = timestamp;
       }
-      
       animationFrameRef.current = requestAnimationFrame(animate);
     };
-    
     animationFrameRef.current = requestAnimationFrame(animate);
-    
     return () => {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
       lastFrameTimeRef.current = null;
     };
-  }, [particlesEnabled, particleOpacity, particleSpeed]);
+  }, [particlesEnabled, particleOpacity, particleSpeed, simulatorReadyToken]);
   
   
-  // ============================================================
-  // DeckGL Layers
-  // ============================================================
+  // Layers
   const layers = useMemo(() => {
     const result = [];
-    
     if (coloredCells) {
+      const triggerKey = `${date}-${variable}-${colormapKey}-${rangeMode}-${hourFloat.toFixed(2)}-${opacity}`;
       result.push(createScalarLayer({
         id: `scalar-${variable}-${date}`,
         coloredCells: coloredCells.cells,
-        timeIndex: hourIndex,
+        updateTriggerKey: triggerKey,
       }));
     }
-    
     if (particlesEnabled && particleSegments.length > 0) {
       result.push(new LineLayer({
         id: "particle-lines",
@@ -302,7 +305,6 @@ export default function App() {
         parameters: { depthTest: false },
       }));
     }
-    
     if (particlesEnabled && particleHeads.length > 0) {
       result.push(new ScatterplotLayer({
         id: "particle-heads",
@@ -316,22 +318,18 @@ export default function App() {
         parameters: { depthTest: false },
       }));
     }
-    
     return result;
-  }, [coloredCells, variable, date, hourIndex,
+  }, [coloredCells, variable, date, hourFloat, opacity, colormapKey, rangeMode,
       particlesEnabled, particleSegments, particleHeads]);
   
   
-  // ============================================================
-  // 点击采样 (用当前变量的数据)
-  // ============================================================
+  // 点击采样
   const handleDeckClick = (info) => {
     if (!info?.coordinate || !grid || !coloredCells) return;
     const [lon, lat] = info.coordinate;
     const value = sampleAtPoint(
       grid.oceanCells, coloredCells.frameData, grid.nXi, lon, lat
     );
-    
     const map = mapRef.current?.getMap?.();
     if (map) {
       const projected = map.project([lon, lat]);
@@ -340,15 +338,11 @@ export default function App() {
     setPickedPoint({ lon, lat, value });
   };
   
-  
-  // ============================================================
   // 弹窗位置同步
-  // ============================================================
   useEffect(() => {
     if (!pickedPoint || !mapRef.current) return;
     const map = mapRef.current.getMap?.();
     if (!map) return;
-    
     const update = () => {
       const p = map.project([pickedPoint.lon, pickedPoint.lat]);
       setPopupScreenPos({ x: p.x, y: p.y });
@@ -363,24 +357,17 @@ export default function App() {
     };
   }, [pickedPoint]);
   
-  
-  // ============================================================
-  // 切日期/切变量时清除旧的采样弹窗
-  // ============================================================
+  // 切日期/变量时清除弹窗
   useEffect(() => {
     setPickedPoint(null);
     setPopupScreenPos(null);
   }, [date, variable]);
   
-  
-  // ============================================================
-  // hourIndex 越界保护
-  // ============================================================
+  // 切日期时停止播放
   useEffect(() => {
-    if (day && hourIndex >= day.nFrames) {
-      setHourIndex(0);
-    }
-  }, [day, hourIndex]);
+    if (dayState.loading) pause();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dayState.loading]);
   
   
   // ============================================================
@@ -396,6 +383,7 @@ export default function App() {
     <div style={{
       width: "100vw", height: "100vh",
       position: "relative", overflow: "hidden",
+      background: theme.bgSolid,
     }}>
       <DeckGL
         initialViewState={initialViewState}
@@ -406,6 +394,103 @@ export default function App() {
         <Map ref={mapRef} mapStyle={mapStyle} reuseMaps />
       </DeckGL>
       
+      {/* 顶栏 */}
+      {datesIndex && (
+        <TopBar
+          date={date}
+          remoteDates={datesIndex.remote}
+          availableDates={datesIndex.available}
+          onDateChange={setDate}
+          switchingDate={dayState.loading}
+        />
+      )}
+      
+      {/* 左侧图标栏 */}
+      {day && (
+        <IconSidebar
+          activeKey={activeSidebar}
+          setActiveKey={setActiveSidebar}
+        />
+      )}
+      
+      {/* Popovers (按 activeSidebar 切换) */}
+      {day && activeSidebar === "variable" && (
+        <VariablePopover
+          variable={variable}
+          setVariable={setVariable}
+          ranges={day.ranges}
+        />
+      )}
+      {day && activeSidebar === "colormap" && (
+        <ColormapPopover
+          colormapKey={colormapKey}
+          setColormapKey={setColormapKey}
+          rangeMode={rangeMode}
+          setRangeMode={setRangeMode}
+        />
+      )}
+      {day && activeSidebar === "particles" && (
+        <ParticlesPopover
+          particlesEnabled={particlesEnabled}
+          setParticlesEnabled={setParticlesEnabled}
+          particleOpacity={particleOpacity}
+          setParticleOpacity={setParticleOpacity}
+          particleSpeed={particleSpeed}
+          setParticleSpeed={setParticleSpeed}
+          particleCount={particleCount}
+          setParticleCount={setParticleCount}
+        />
+      )}
+      {day && activeSidebar === "opacity" && (
+        <OpacityPopover
+          opacity={opacity}
+          setOpacity={setOpacity}
+        />
+      )}
+      
+      {/* 底部时间轴 */}
+      {day && (
+        <BottomTimebar
+          hourFloat={hourFloat}
+          setHourFloat={setHourFloat}
+          times={day.times}
+          maxHour={MAX_HOUR}
+          isPlaying={isPlaying}
+          togglePlay={togglePlay}
+          playbackSpeed={playbackSpeed}
+          setPlaybackSpeed={setPlaybackSpeed}
+        />
+      )}
+      
+      {/* 右下角图例 */}
+      {coloredCells && (
+        <ColorbarLegend
+          variable={variable}
+          min={coloredCells.colorMin}
+          max={coloredCells.colorMax}
+          cssGradient={coloredCells.cmap.css}
+          unit={VARIABLE_UNITS[variable] ?? ""}
+          rangeMode={rangeMode}
+        />
+      )}
+      
+      {/* 粒子图例 (仅粒子开启时显示, 叠在温度图例上方) */}
+      {particlesEnabled && coloredCells && (
+        <ParticleLegend bottomOffset={110} />
+      )}
+      
+      {/* 点击采样小卡片 */}
+      {pickedPoint && popupScreenPos && day && (
+        <PointPopup
+          point={pickedPoint}
+          screenPos={popupScreenPos}
+          variable={variable}
+          unit={VARIABLE_UNITS[variable] ?? ""}
+          onClose={() => { setPickedPoint(null); setPopupScreenPos(null); }}
+        />
+      )}
+      
+      {/* 全屏遮罩 */}
       <LoadingOverlay
         visible={showFullScreenOverlay && !gridError}
         stage={
@@ -417,6 +502,7 @@ export default function App() {
         error={gridError}
       />
       
+      {/* 顶部进度条 (切日期时) */}
       <TopProgressBar
         visible={dayState.loading && !!day}
         progress={dayState.progress}
@@ -424,159 +510,6 @@ export default function App() {
         error={dayState.error}
         showSlowWarning={showSlowWarning}
       />
-      
-      {pickedPoint && popupScreenPos && day && (
-        <PointPopup
-          point={pickedPoint}
-          screenPos={popupScreenPos}
-          variable={variable}
-          unit={VARIABLE_COLORMAPS[variable].unit}
-          onClose={() => { setPickedPoint(null); setPopupScreenPos(null); }}
-        />
-      )}
-      
-      {day && datesIndex && (
-        <ControlPanel
-          date={date}
-          times={day.times}
-          hourIndex={hourIndex}
-          setHourIndex={setHourIndex}
-          variable={variable}
-          setVariable={setVariable}
-          colorRange={coloredCells ? [coloredCells.colorMin, coloredCells.colorMax] : null}
-          opacity={opacity}
-          setOpacity={setOpacity}
-          remoteDates={datesIndex.remote}
-          availableDates={datesIndex.available}
-          onDateChange={setDate}
-          switchingDate={dayState.loading}
-          particlesEnabled={particlesEnabled}
-          setParticlesEnabled={setParticlesEnabled}
-          particleOpacity={particleOpacity}
-          setParticleOpacity={setParticleOpacity}
-          particleSpeed={particleSpeed}
-          setParticleSpeed={setParticleSpeed}
-          particleCount={particleCount}
-          setParticleCount={setParticleCount}
-        />
-      )}
-      
-      {coloredCells && (
-        <ColorbarLegend
-          variable={variable}
-          min={coloredCells.colorMin}
-          max={coloredCells.colorMax}
-          cssGradient={coloredCells.cmap.css}
-          unit={coloredCells.cmap.unit}
-        />
-      )}
-    </div>
-  );
-}
-
-
-// ============================================================
-// 子组件: 点击采样弹窗
-// ============================================================
-function PointPopup({ point, screenPos, variable, unit, onClose }) {
-  const title = {
-    temp: "Surface Temperature",
-    salt: "Surface Salinity",
-    zeta: "Sea Level Height",
-  }[variable] || variable.toUpperCase();
-  
-  return (
-    <div style={{
-      position: "absolute",
-      left: screenPos.x, top: screenPos.y - 18,
-      transform: "translate(-50%, -100%)",
-      zIndex: 9999, pointerEvents: "auto",
-    }}>
-      <div style={{
-        minWidth: 180,
-        background: "rgba(255,255,255,0.97)", color: "#111827",
-        borderRadius: 12, boxShadow: "0 12px 26px rgba(0,0,0,0.22)",
-        padding: "10px 12px", fontFamily: "Inter, Arial, sans-serif",
-        position: "relative",
-      }}>
-        <button onClick={onClose} style={{
-          position: "absolute", top: 6, right: 8,
-          border: "none", background: "transparent", color: "#6b7280",
-          fontSize: 16, cursor: "pointer", lineHeight: 1,
-        }}>×</button>
-        
-        <div style={{
-          fontSize: 11, fontWeight: 700, marginBottom: 6, color: "#374151",
-          textTransform: "uppercase", letterSpacing: "0.04em", paddingRight: 16,
-        }}>
-          {title}
-        </div>
-        
-        {point.value == null ? (
-          <div style={{ fontSize: 14, color: "#6b7280" }}>No valid ocean data</div>
-        ) : (
-          <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.05 }}>
-            {point.value.toFixed(2)} {unit}
-          </div>
-        )}
-        
-        <div style={{ fontSize: 11, color: "#6b7280", marginTop: 6 }}>
-          {point.lat.toFixed(4)}, {point.lon.toFixed(4)}
-        </div>
-        
-        <div style={{
-          position: "absolute", left: "50%", bottom: -8,
-          transform: "translateX(-50%)", width: 0, height: 0,
-          borderLeft: "8px solid transparent",
-          borderRight: "8px solid transparent",
-          borderTop: "8px solid rgba(255,255,255,0.97)",
-        }}/>
-      </div>
-    </div>
-  );
-}
-
-
-// ============================================================
-// 子组件: 图例
-// ============================================================
-function ColorbarLegend({ variable, min, max, cssGradient, unit }) {
-  const mid = (min + max) / 2;
-  const q1 = min + (max - min) * 0.25;
-  const q3 = min + (max - min) * 0.75;
-  
-  const titleMap = {
-    temp: "Temperature",
-    salt: "Salinity",
-    zeta: "Sea Level",
-  };
-  const title = titleMap[variable] || variable.toUpperCase();
-  
-  return (
-    <div style={{
-      position: "absolute", right: 18, bottom: 18, zIndex: 20, width: 280,
-      background: "rgba(255,255,255,0.92)", backdropFilter: "blur(8px)",
-      borderRadius: 18, boxShadow: "0 10px 30px rgba(0,0,0,0.12)",
-      padding: "14px 16px", fontFamily: "Inter, Arial, sans-serif",
-      color: "#1f2937",
-    }}>
-      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>
-        {title} {unit ? `(${unit})` : ""}
-      </div>
-      <div style={{
-        height: 14, borderRadius: 999, background: cssGradient,
-        boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.06)",
-      }}/>
-      <div style={{
-        display: "flex", justifyContent: "space-between",
-        marginTop: 6, fontSize: 11, color: "#374151",
-      }}>
-        <span>{min.toFixed(1)}</span>
-        <span>{q1.toFixed(1)}</span>
-        <span>{mid.toFixed(1)}</span>
-        <span>{q3.toFixed(1)}</span>
-        <span>{max.toFixed(1)}</span>
-      </div>
     </div>
   );
 }
