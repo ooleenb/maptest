@@ -1,0 +1,77 @@
+# ============================================================
+# docker-compose.yml — Ocean Viz full stack
+# ============================================================
+# 用法:
+#   docker-compose build       一次性构建 (5-10 分钟)
+#   docker-compose up          启动两个容器 (30 秒)
+#   docker-compose up -d       后台启动
+#   docker-compose down        停止+删除容器 (数据保留, 因为是 volume 挂载)
+#   docker-compose logs -f     看实时日志
+#
+# 访问:
+#   前端 UI:   http://localhost:8081
+#   后端 API:  http://localhost:8000/api/sources    (直接调试用)
+
+services:
+  
+  # ============================================================
+  # Backend: FastAPI + xarray
+  # ============================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ocean-viz-backend
+    
+    # 容器内 8000 -> host 8000 (用于直接调试 API)
+    ports:
+      - "8000:8000"
+    
+    # 数据持久化:
+    # host ./backend/data/  ↔  容器 /app/data/
+    # 这样 grid 缓存和预生成的 day 数据都保留在你电脑上,
+    # 容器重启不丢
+    volumes:
+      - ./backend/data:/app/data
+    
+    # 崩了自动重启 (除非你 docker-compose down)
+    restart: unless-stopped
+    
+    # 健康检查: 每 30 秒检查一次 API 是否活着
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # 启动 60 秒后才开始检查 (给 prep_day 时间)
+  
+  
+  # ============================================================
+  # Frontend: Nginx serving compiled React + reverse proxy to backend
+  # ============================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ocean-viz-frontend
+    
+    # 容器内 80 -> host 8081
+    # (浏览器访问 http://localhost:8081)
+    ports:
+      - "8081:80"
+    
+    # 前端启动前先等后端 healthy
+    # (不等会导致前端启动后 /api 反代失败几秒)
+    depends_on:
+      backend:
+        condition: service_started
+    
+    restart: unless-stopped
+
+
+# ============================================================
+# 网络: 默认网络已经够用
+# ============================================================
+# docker-compose 自动创建一个虚拟网络, 两个服务可以用服务名互相访问
+# (frontend 容器内 ping "backend" 就能通)
+# 所以不用显式配置 networks
