@@ -24,9 +24,10 @@ ROMS 网格元数据加载与缓存。
     
     meta = get_grid_meta("perth")
     print(meta.mask_rho.shape)         # (259, 129)
-    print(meta.bounds)                 # {minLon, maxLon, minLat, maxLat}
-    print(len(meta.ocean_cells))       # 海洋格子数,远小于 259*129
     
+    meta_cwa = get_grid_meta("cwa")
+    print(meta_cwa.mask_rho.shape)     # (640, 480)
+
 依赖:
 -----
     pip install xarray netCDF4 numpy
@@ -59,28 +60,28 @@ if not logger.handlers:
 # ============================================================
 # 配置: 数据源对应的 grid 文件
 # ============================================================
-# 和 data_loader.py 解耦,这里独立定义,因为 grid 文件可能在不同的 catalog 下
 GRID_SOURCES = {
     "perth": {
-        # 用户已验证: perth_his_grid.nc 在 perthhis 目录下
         "url": "http://boreas.mywire.org:8080/thredds/dodsC/perthhis/perth_his_grid.nc",
-        "expected_shape": (259, 129),  # 用于校验下载是否正确
+        "expected_shape": (259, 129),
     },
-    # 未来扩展:
-    # "cwa": {...}
+    "cwa": {
+        # ⚠️ URL 命名 misleading:
+        # cwa_qck_2026.ncml 这个 "ncml" 实际是 grid 文件(无 ocean_time, 只有静态网格)
+        # 真正的数据聚合在 cwa_qck_202601.ncml (见 data_loader.py 配置)
+        "url": "http://boreas.mywire.org:8080/thredds/dodsC/cwaqck/cwa_qck_2026.ncml",
+        "expected_shape": (640, 480),
+    },
 }
 
 
 # ============================================================
 # 缓存路径
 # ============================================================
-# 默认存在项目根的 backend/data/grid/ 下
-# 用环境变量 ROMS_GRID_CACHE_DIR 可以覆盖(Docker 部署时用)
 def _get_cache_dir() -> Path:
     cache = os.environ.get("ROMS_GRID_CACHE_DIR")
     if cache:
         return Path(cache)
-    # 默认: backend/data/grid/  (相对于本文件位置)
     return Path(__file__).resolve().parent.parent / "data" / "grid"
 
 
@@ -95,36 +96,24 @@ class GridMeta:
     所有数组都是 numpy ndarray,float32 节省空间。
     包含原始 ROMS 网格量 + 预计算的可视化辅助结构。
     """
-    # 数据源标识
     source_name: str
     
-    # 原始 ROMS 网格量
-    lon_rho: np.ndarray         # (eta, xi) 格子中心经度
-    lat_rho: np.ndarray         # (eta, xi) 格子中心纬度
-    lon_vert: np.ndarray        # (eta+1, xi+1) 格子顶点经度
-    lat_vert: np.ndarray        # (eta+1, xi+1) 格子顶点纬度
-    mask_rho: np.ndarray        # (eta, xi) 1=海, 0=陆
-    h: np.ndarray               # (eta, xi) 海底深度(米),陆地处可能是无效值
-    pm: np.ndarray              # (eta, xi) ξ 方向度量因子 (1/m)
-    pn: np.ndarray              # (eta, xi) η 方向度量因子 (1/m)
-    angle: np.ndarray           # (eta, xi) 网格旋转角(弧度)
+    lon_rho: np.ndarray
+    lat_rho: np.ndarray
+    lon_vert: np.ndarray
+    lat_vert: np.ndarray
+    mask_rho: np.ndarray
+    h: np.ndarray
+    pm: np.ndarray
+    pn: np.ndarray
+    angle: np.ndarray
     
-    # 形状
     n_eta: int
     n_xi: int
     
-    # 地理边界(用于地图初始视图)
     bounds: dict = field(default_factory=dict)
-    # bounds 结构: {"minLon": ..., "maxLon": ..., "minLat": ..., "maxLat": ...}
-    
-    # 预计算: 海洋格子的多边形列表(DeckGL PolygonLayer 直接吃)
-    # 每个元素是 {"row": r, "col": c, "polygon": [[lon, lat], ...], "h": depth}
-    # 这是前端 buildRawCells 在做的事,我们提前算好,前端零计算
     ocean_cells: list[dict] = field(default_factory=list)
-    
-    # 推荐的地图初始视图
     suggested_view: dict = field(default_factory=dict)
-    # suggested_view 结构: {"longitude": ..., "latitude": ..., "zoom": ...}
 
 
 # ============================================================
@@ -132,11 +121,7 @@ class GridMeta:
 # ============================================================
 def _estimate_zoom(minLon: float, maxLon: float,
                     minLat: float, maxLat: float) -> int:
-    """根据经纬度跨度估算一个合理的 Mapbox zoom 等级。
-    
-    参数命名用驼峰是为了能直接 **bounds 解包 (bounds 字典用驼峰 key,
-    因为最终要传给前端 JSON,前端 JS 习惯驼峰)。
-    """
+    """根据经纬度跨度估算一个合理的 Mapbox zoom 等级。"""
     span = max(maxLon - minLon, maxLat - minLat)
     if span > 20:   return 3
     if span > 10:   return 4
@@ -155,29 +140,48 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
     """
     从一个 NetCDF 文件加载网格元数据。
     可以是本地路径,也可以是 OPeNDAP URL。
+    
+    必需变量: lon_rho, lat_rho, lon_vert, lat_vert, mask_rho, h
+    可选变量: pm, pn, angle (Perth 有, CWA 没有)
     """
     logger.info(f"Loading grid metadata from: {nc_path}")
     t0 = time.time()
     
     with xr.open_dataset(str(nc_path)) as ds:
-        # 提取所有需要的变量,立刻 load 到内存
-        # 关键: 用 .values 触发实际读取
+        # 必需变量 (没有会报错)
         lon_rho = ds["lon_rho"].values.astype(np.float64)
         lat_rho = ds["lat_rho"].values.astype(np.float64)
         lon_vert = ds["lon_vert"].values.astype(np.float64)
         lat_vert = ds["lat_vert"].values.astype(np.float64)
         mask_rho = ds["mask_rho"].values.astype(np.float32)
         h = ds["h"].values.astype(np.float32)
-        pm = ds["pm"].values.astype(np.float32)
-        pn = ds["pn"].values.astype(np.float32)
-        angle = ds["angle"].values.astype(np.float32)
+        
+        # 可选变量 (Perth 有, CWA 没有)
+        # 不存在时用占位符: pm/pn 用 1.0 (假装是 1m 网格, 仅 Test 4 报告会显示奇怪),
+        # angle 用 0 (假装网格不旋转, 对 surface u/v 不影响)
+        if "pm" in ds.variables:
+            pm = ds["pm"].values.astype(np.float32)
+        else:
+            logger.info(f"  Note: 'pm' not in grid file, using placeholder")
+            pm = np.ones_like(mask_rho)
+        
+        if "pn" in ds.variables:
+            pn = ds["pn"].values.astype(np.float32)
+        else:
+            logger.info(f"  Note: 'pn' not in grid file, using placeholder")
+            pn = np.ones_like(mask_rho)
+        
+        if "angle" in ds.variables:
+            angle = ds["angle"].values.astype(np.float32)
+        else:
+            logger.info(f"  Note: 'angle' not in grid file, using zeros (no rotation)")
+            angle = np.zeros_like(mask_rho)
     
     elapsed = time.time() - t0
     logger.info(f"  Loaded in {elapsed:.1f}s. Grid shape: {mask_rho.shape}")
     
     n_eta, n_xi = mask_rho.shape
     
-    # 边界(只考虑有效经纬度,陆地点 lat_rho 应该都是合法值,但保险起见过滤)
     valid = np.isfinite(lon_rho) & np.isfinite(lat_rho)
     bounds = {
         "minLon": float(np.min(lon_rho[valid])),
@@ -186,7 +190,6 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
         "maxLat": float(np.max(lat_rho[valid])),
     }
     
-    # 推荐视图
     center_lon = (bounds["minLon"] + bounds["maxLon"]) / 2
     center_lat = (bounds["minLat"] + bounds["maxLat"]) / 2
     zoom = _estimate_zoom(**bounds)
@@ -196,8 +199,6 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
         "zoom": zoom,
     }
     
-    # 预计算 ocean_cells (海洋格子的多边形)
-    # 这是前端 buildRawCells 在做的事,我们提前算好
     logger.info(f"  Pre-computing ocean cell polygons...")
     t1 = time.time()
     ocean_cells = _build_ocean_cells(
@@ -254,11 +255,9 @@ def _build_ocean_cells(
     
     for i in range(n_eta):
         for j in range(n_xi):
-            # 只保留海洋格子
             if mask_rho[i, j] < 0.5:
                 continue
             
-            # 4 个角点(注意顺序: 逆时针,DeckGL 标准)
             lon00 = lon_vert[i,     j  ]
             lat00 = lat_vert[i,     j  ]
             lon10 = lon_vert[i,     j+1]
@@ -268,7 +267,6 @@ def _build_ocean_cells(
             lon01 = lon_vert[i+1, j  ]
             lat01 = lat_vert[i+1, j  ]
             
-            # 跳过任何角点坐标无效的格子
             if not (np.isfinite(lon00) and np.isfinite(lon10) and
                     np.isfinite(lon11) and np.isfinite(lon01)):
                 continue
@@ -300,18 +298,9 @@ def get_grid_meta(
     
     流程:
     -----
-    1. 检查本地缓存 (.nc 文件 + 预计算的 ocean_cells.json)
+    1. 检查本地缓存
     2. 缓存存在且不强制刷新 -> 从本地加载
-    3. 否则 -> 从 OPeNDAP 下载 grid 文件 -> 缓存到本地 -> 加载
-    
-    参数:
-    -----
-    source_name: 'perth' / 'cwa' / ...
-    force_refresh: True = 强制重新从网络下载
-    
-    返回:
-    -----
-    GridMeta 对象
+    3. 否则 -> 从 OPeNDAP 下载 -> 缓存到本地 -> 加载
     """
     if source_name not in GRID_SOURCES:
         available = ", ".join(GRID_SOURCES.keys())
@@ -325,19 +314,16 @@ def get_grid_meta(
     
     local_nc = cache_dir / f"{source_name}_grid.nc"
     
-    # 检查本地缓存
     if local_nc.exists() and not force_refresh:
         logger.info(f"Using cached grid file: {local_nc}")
         meta = _load_grid_from_nc(local_nc, source_name)
         _verify_grid(meta, config)
         return meta
     
-    # 从网络下载 (尝试主 URL,失败则用 fallback)
     urls_to_try = [config["url"]]
     if "url_fallback" in config:
         urls_to_try.append(config["url_fallback"])
     
-    # 阶段 1: 下载到本地(只对网络错误重试 fallback)
     download_error = None
     downloaded = False
     for url in urls_to_try:
@@ -373,7 +359,6 @@ def get_grid_meta(
             f"Failed to download grid from all URLs. Last error: {download_error}"
         )
     
-    # 阶段 2: 从本地文件加载(任何错误都直接抛出,这是代码 bug 不是网络问题)
     meta = _load_grid_from_nc(local_nc, source_name)
     _verify_grid(meta, config)
     return meta
@@ -396,15 +381,6 @@ def _verify_grid(meta: GridMeta, config: dict) -> None:
 def export_grid_to_json(meta: GridMeta, output_path: str | Path) -> None:
     """
     把网格元数据中"前端需要的部分"导出成 JSON。
-    
-    前端不需要原始 mask_rho/pm/pn/angle 这些(那是科学计算用的),
-    只需要:
-    - bounds (用来 fit 地图)
-    - suggested_view (初始视图)
-    - ocean_cells (用来画温度场)
-    - n_eta / n_xi (用来知道粒子场的形状)
-    
-    这个 JSON 体积大概几 MB(主要是 ocean_cells,一万多个海洋格子)。
     """
     payload = {
         "source_name": meta.source_name,
@@ -417,7 +393,7 @@ def export_grid_to_json(meta: GridMeta, output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        json.dump(payload, f, separators=(",", ":"))  # 压缩格式,不缩进
+        json.dump(payload, f, separators=(",", ":"))
     size_mb = output_path.stat().st_size / 1024 / 1024
     logger.info(f"Exported grid JSON to {output_path} ({size_mb:.2f} MB)")
 
@@ -427,24 +403,27 @@ def export_grid_to_json(meta: GridMeta, output_path: str | Path) -> None:
 # ============================================================
 if __name__ == "__main__":
     """
-    用法: python grid_meta.py
+    用法:
+        python grid_meta.py              # 测试 perth (默认)
+        python grid_meta.py cwa          # 测试 cwa
     
     第一次运行会从 OPeNDAP 下载 grid 文件并缓存到本地。
     之后运行直接从本地加载,几乎瞬时。
     """
+    import sys
+    source = sys.argv[1] if len(sys.argv) > 1 else "perth"
+    
     print("=" * 60)
-    print("Testing grid_meta (perth)")
+    print(f"Testing grid_meta ({source})")
     print("=" * 60)
     
-    # 测试 1: 加载网格(第一次会下载,之后用缓存)
     print("\n[Test 1] Load grid metadata")
-    meta = get_grid_meta("perth")
+    meta = get_grid_meta(source)
     print(f"  Source: {meta.source_name}")
     print(f"  Shape: ({meta.n_eta}, {meta.n_xi})")
     print(f"  Bounds: {meta.bounds}")
     print(f"  Suggested view: {meta.suggested_view}")
     
-    # 测试 2: 海陆比例
     print("\n[Test 2] Ocean cells statistics")
     n_ocean = int(np.sum(meta.mask_rho > 0.5))
     n_total = meta.n_eta * meta.n_xi
@@ -453,37 +432,39 @@ if __name__ == "__main__":
     print(f"  Land cells:   {n_total - n_ocean}")
     print(f"  Polygon count: {len(meta.ocean_cells)} (filtered for valid coords)")
     
-    # 测试 3: 水深统计
     print("\n[Test 3] Bathymetry statistics")
     ocean_h = meta.h[meta.mask_rho > 0.5]
     valid_h = ocean_h[np.isfinite(ocean_h)]
     print(f"  Depth range: {np.min(valid_h):.1f} ~ {np.max(valid_h):.1f} m")
     print(f"  Mean depth:  {np.mean(valid_h):.1f} m")
     
-    # 测试 4: 网格度量因子
     print("\n[Test 4] Grid metric factors")
-    # pm = 1/dx, dx = 1/pm
-    dx = 1.0 / meta.pm[meta.mask_rho > 0.5]
-    dy = 1.0 / meta.pn[meta.mask_rho > 0.5]
-    print(f"  dx (m): mean={np.mean(dx):.1f}, "
-          f"min={np.min(dx):.1f}, max={np.max(dx):.1f}")
-    print(f"  dy (m): mean={np.mean(dy):.1f}, "
-          f"min={np.min(dy):.1f}, max={np.max(dy):.1f}")
-    print(f"  ↑ Confirms model resolution (should be ~500m)")
+    if np.allclose(meta.pm, 1.0):
+        print(f"  pm/pn not in grid file (using placeholder)")
+        print(f"  Skipping resolution check")
+    else:
+        dx = 1.0 / meta.pm[meta.mask_rho > 0.5]
+        dy = 1.0 / meta.pn[meta.mask_rho > 0.5]
+        print(f"  dx (m): mean={np.mean(dx):.1f}, "
+              f"min={np.min(dx):.1f}, max={np.max(dx):.1f}")
+        print(f"  dy (m): mean={np.mean(dy):.1f}, "
+              f"min={np.min(dy):.1f}, max={np.max(dy):.1f}")
+        expected_res = {"perth": 500, "cwa": 2000}.get(source, "?")
+        print(f"  ↑ Expected ~{expected_res}m resolution")
     
-    # 测试 5: 第一个海洋格子的多边形
     print("\n[Test 5] Sample ocean cell")
     if meta.ocean_cells:
         cell = meta.ocean_cells[0]
         print(f"  Cell (row={cell['row']}, col={cell['col']}):")
-        print(f"    Depth: {cell['depth']:.1f} m")
+        depth = cell.get('depth')
+        if depth is not None:
+            print(f"    Depth: {depth:.1f} m")
         print(f"    Polygon corners:")
         for corner in cell['polygon']:
             print(f"      [{corner[0]:.4f}, {corner[1]:.4f}]")
     
-    # 测试 6: 导出 JSON(测试前端打包流程)
     print("\n[Test 6] Export to JSON")
-    output_dir = Path(__file__).resolve().parent.parent / "data" / "frames" / "perth"
+    output_dir = Path(__file__).resolve().parent.parent / "data" / "frames" / source
     output_dir.mkdir(parents=True, exist_ok=True)
     export_grid_to_json(meta, output_dir / "grid.json")
     
