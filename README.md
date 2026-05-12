@@ -183,9 +183,9 @@ npm run dev
 
 UI runs at `http://localhost:5173`. The dev server's `vite.config.js` proxies `/api` to `http://localhost:8000`, so the frontend talks to the locally running backend.
 
----
+<!-- --- -->
 
-## Technology stack
+<!-- ## Technology stack
 
 | Layer | Technology |
 |---|---|
@@ -214,7 +214,7 @@ The original project brief proposed a Java-based system built on [Kalisio Kano +
 - **WRF atmosphere model integration**: A WRF data source was scoped (`wrf_roms_d02_*.nc` on the same THREDDS server, providing 10 m wind, 2 m temperature, sea-level pressure, rainfall) but not deployed in this version. The data loader and grid handler were designed to accommodate a third source with minor configuration changes.
 - **CWA playback performance**: Animation playback on the CWA grid (282 K cells) is throttled to hour-bucketed updates to avoid main-thread blocking. A future version could use GPU texture rendering for smooth continuous interpolation.
 - **Cell-based rendering**: The visualisation deliberately preserves discrete ROMS grid cells rather than smoothing them (as windy.com does). This is a transparency decision — the user sees the actual model output, not a post-processed approximation. A "smooth mode" toggle is a possible future option.
-- **HTTPS / production deployment**: Currently configured for local Docker only. Cloud deployment (UWA-provided server) is straightforward but requires server-specific configuration (HTTPS, domain, reverse proxy front-end).
+- **HTTPS / production deployment**: Currently configured for local Docker only. Cloud deployment (UWA-provided server) is straightforward but requires server-specific configuration (HTTPS, domain, reverse proxy front-end). -->
 
 ---
 
