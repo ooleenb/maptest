@@ -14,7 +14,7 @@ Prerequisite: Have [Docker Desktop](https://www.docker.com/products/docker-deskt
 
 ```bash
 git clone https://github.com/ooleenb/ocean-viz.git
-cd MapTest
+cd ocean-viz
 docker-compose up
 ```
 
