@@ -77,31 +77,29 @@ function sampleUV(u, v, mask, nEta, nXi, bounds, lon, lat) {
 // ============================================================
 // 重生
 // ============================================================
-function spawnParticle(uvFrame, bounds) {
-  const { u, v, mask, nEta, nXi } = uvFrame;
-  
-  for (let attempt = 0; attempt < 60; attempt++) {
-    const row = Math.floor(Math.random() * nEta);
-    const col = Math.floor(Math.random() * nXi);
-    const idx = row * nXi + col;
-    
-    if (mask[idx] === 1 && Number.isFinite(u[idx]) && Number.isFinite(v[idx])) {
-      const lon = bounds.minLon + (col / (nXi - 1)) * (bounds.maxLon - bounds.minLon);
-      const lat = bounds.minLat + (row / (nEta - 1)) * (bounds.maxLat - bounds.minLat);
-      return {
-        lon, lat,
-        history: [],
-        age: 0,
-        lastSpeed: 0,
-        lastU: 0,
-        lastV: 0,
-      };
-    }
-  }
-  
-  const lon = bounds.minLon + Math.random() * (bounds.maxLon - bounds.minLon);
-  const lat = bounds.minLat + Math.random() * (bounds.maxLat - bounds.minLat);
-  return { lon, lat, history: [], age: 0, lastSpeed: 0, lastU: 0, lastV: 0 };
+// ⭐ spawn 粒子: 从真实的海洋格子列表里随机选, 用 polygon 的中心点作为 lon/lat。
+//
+// 为什么不能按 (row, col) 用 bounds 线性插值反推 lon/lat:
+//   ROMS 是曲线网格, 不是经纬度对齐的均匀矩形.
+//   在 Perth 这种小范围域 (70km), 误差很小 (网格几乎是矩形).
+//   在 CWA 这种大范围域 (1300km), 误差可达几十公里, 会把粒子扔到陆地上.
+//
+// 用 oceanCells 的 polygon 角点平均值作为格子中心, 是几何上正确的位置.
+function spawnParticle(oceanCells) {
+  const cell = oceanCells[Math.floor(Math.random() * oceanCells.length)];
+  // polygon 是 4 个角点 [[lon0,lat0], [lon1,lat1], [lon2,lat2], [lon3,lat3]]
+  // 取对角线中点 = 矩形中心 (近似)
+  const poly = cell.polygon;
+  const lon = (poly[0][0] + poly[2][0]) * 0.5;
+  const lat = (poly[0][1] + poly[2][1]) * 0.5;
+  return {
+    lon, lat,
+    history: [],
+    age: 0,
+    lastSpeed: 0,
+    lastU: 0,
+    lastV: 0,
+  };
 }
 
 
@@ -138,35 +136,42 @@ function speedToRGB(speed) {
 // 粒子模拟器
 // ============================================================
 export class ParticleSimulator {
-  constructor({ uvFrame, bounds, nParticles = 1400 }) {
+  constructor({ uvFrame, bounds, oceanCells, nParticles = 1400, trailLength }) {
     this.uvFrame = uvFrame;
     this.bounds = bounds;
+    this.oceanCells = oceanCells;     // ⭐ 真实海洋格子列表 (来自 grid.json)
     this.particles = Array.from({ length: nParticles }, () =>
-      spawnParticle(uvFrame, bounds)
+      spawnParticle(oceanCells)
     );
-    this.maxAge = 180;  // 总寿命: ~3 秒。配合 FADE_OUT=40, 成熟期约 130 帧 (2 秒)
-    this.trailLength = TRAIL_LENGTH;
+    this.maxAge = 180;
+    this.trailLength = trailLength ?? TRAIL_LENGTH;
   }
   
   updateUVFrame(uvFrame) {
     this.uvFrame = uvFrame;
   }
   
-  reset(uvFrame, bounds) {
+  reset(uvFrame, bounds, oceanCells) {
     this.uvFrame = uvFrame;
     this.bounds = bounds;
-    this.particles = this.particles.map(() => spawnParticle(uvFrame, bounds));
+    if (oceanCells) this.oceanCells = oceanCells;
+    this.particles = this.particles.map(() => spawnParticle(this.oceanCells));
   }
   
   setParticleCount(n) {
     const current = this.particles.length;
     if (n > current) {
       for (let i = 0; i < n - current; i++) {
-        this.particles.push(spawnParticle(this.uvFrame, this.bounds));
+        this.particles.push(spawnParticle(this.oceanCells));
       }
     } else if (n < current) {
       this.particles.length = n;
     }
+  }
+  
+  // ⭐ 允许运行时调节拖尾长度 (CWA 范围大需要长拖尾才看得见)
+  setTrailLength(n) {
+    this.trailLength = Math.max(10, Math.min(200, n));
   }
   
   /**
@@ -175,7 +180,7 @@ export class ParticleSimulator {
    * - heads: 头部点列表 (每个粒子当前位置)
    */
   step(dtSeconds, speedFactor, baseAlpha) {
-    const { uvFrame, bounds, particles, maxAge, trailLength } = this;
+    const { uvFrame, bounds, oceanCells, particles, maxAge, trailLength } = this;
     const { u, v, mask, nEta, nXi } = uvFrame;
     
     const simSeconds = dtSeconds * speedFactor;
@@ -187,7 +192,7 @@ export class ParticleSimulator {
       
       // 已经"死透"了 (age 超过 maxAge): 真正重生
       if (p.age >= maxAge) {
-        const np = spawnParticle(uvFrame, bounds);
+        const np = spawnParticle(oceanCells);
         p.lon = np.lon; p.lat = np.lat;
         p.history = []; p.age = 0; p.lastSpeed = 0;
         p.lastU = 0; p.lastV = 0;
@@ -201,9 +206,11 @@ export class ParticleSimulator {
       let triggerDying = false;
       let canMove = false;     // 这一帧能正常移动吗?
       let curU = 0, curV = 0;  // 这一帧要用的 u/v
+      let hitLand = false;     // ⭐ 当前位置在陆地? 这种情况要立刻死透, 不许继续漂
       
       if (!sampled) {
         triggerDying = true;
+        hitLand = true;        // 当前位置就在陆地, 立刻死透
       } else {
         const speed = Math.sqrt(sampled.u * sampled.u + sampled.v * sampled.v);
         if (speed < 0.005) {
@@ -224,11 +231,25 @@ export class ParticleSimulator {
             p.lastU = sampled.u; p.lastV = sampled.v;
             p.lastSpeed = speed;
           } else {
-            // 一切正常,推进
-            canMove = true;
-            curU = sampled.u; curV = sampled.v;
-            p.lastU = sampled.u; p.lastV = sampled.v;
-            p.lastSpeed = speed;
+            // ⭐ 预测下一步位置, 如果落在陆地, 也触发立刻死透
+            // 防止粒子"跨越"岛屿 (CWA 2km 网格 + 高速因子下,
+            // 一帧位移可能比小岛宽, 越岛后又活了)
+            const probe = sampleUV(u, v, mask, nEta, nXi, bounds, newLon, newLat);
+            if (!probe) {
+              // 一步会撞陆: 这一帧推进到边缘后立刻死透
+              triggerDying = true;
+              hitLand = true;
+              canMove = true;
+              curU = sampled.u; curV = sampled.v;
+              p.lastU = sampled.u; p.lastV = sampled.v;
+              p.lastSpeed = speed;
+            } else {
+              // 一切正常, 推进
+              canMove = true;
+              curU = sampled.u; curV = sampled.v;
+              p.lastU = sampled.u; p.lastV = sampled.v;
+              p.lastSpeed = speed;
+            }
           }
         }
       }
@@ -238,13 +259,21 @@ export class ParticleSimulator {
         p.age = maxAge - FADE_OUT_FRAMES;
       }
       
-      // ⭐ 关键: dying 状态如果 canMove=false (例如出界后陆地上),
+      // ⭐ 撞陆: 立刻死透 (跳过 dying 阶段, 不漂)
+      //    history 也清空, 不留拖尾在陆地上
+      if (hitLand) {
+        p.age = maxAge;        // 下一帧 step 进来会被 respawn
+        p.history = [];        // 清空已记录的拖尾
+        p.lastU = 0; p.lastV = 0;
+        continue;              // 跳过本帧推进, 不要画
+      }
+      
+      // dying 状态如果 canMove=false (例如域外漂入陆地),
       // 用上次记录的 lastU/lastV 让粒子继续漂动,
-      // 这样头部点不静止,丝带会和健康粒子一样"流出画面"
+      // 这样头部点不静止, 丝带会和健康粒子一样"流出画面"
       if (triggerDying && !canMove && (p.lastU !== 0 || p.lastV !== 0)) {
         canMove = true;
         curU = p.lastU; curV = p.lastV;
-        // dying 时速度衰减一点点 (每帧 ×0.96), 看起来像"减速消失"
         p.lastU *= 0.96; p.lastV *= 0.96;
       }
       

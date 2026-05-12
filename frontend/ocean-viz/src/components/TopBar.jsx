@@ -3,16 +3,21 @@
  * =====================
  * 
  * 顶部 44px 细横栏。
- * 包含: logo + 副标题 + 日期选择(展开 popover) + 缓存计数。
+ * 包含: logo + 数据源切换按钮 + 日期选择 + 缓存计数。
  */
 
 import React, { useState, useRef, useEffect } from "react";
-import { Waves, Calendar, ChevronDown } from "lucide-react";
+import { Waves, ChevronDown, Layers } from "lucide-react";
 import { theme } from "../theme.js";
+import { getSourceInfo } from "../data/config.js";
 import DateSelectorPopover from "./popovers/DateSelectorPopover.jsx";
+import SourcePopover from "./popovers/SourcePopover.jsx";
 
 
 export default function TopBar({
+  source,
+  onSourceChange,
+  switchingSource,
   date,
   remoteDates,
   availableDates,
@@ -20,14 +25,15 @@ export default function TopBar({
   switchingDate,
 }) {
   const [dateOpen, setDateOpen] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
   const dateBtnRef = useRef(null);
+  const sourceBtnRef = useRef(null);
   
-  // 点击外部关闭 popover
+  // 点击外部关闭日期 popover
   useEffect(() => {
     if (!dateOpen) return;
     const handler = (e) => {
       if (dateBtnRef.current && !dateBtnRef.current.contains(e.target)) {
-        // 检查点击是否落在 popover 内
         if (!e.target.closest("[data-popover='date']")) {
           setDateOpen(false);
         }
@@ -37,9 +43,25 @@ export default function TopBar({
     return () => document.removeEventListener("mousedown", handler);
   }, [dateOpen]);
   
+  // 点击外部关闭数据源 popover
+  useEffect(() => {
+    if (!sourceOpen) return;
+    const handler = (e) => {
+      if (sourceBtnRef.current && !sourceBtnRef.current.contains(e.target)) {
+        if (!e.target.closest("[data-popover='source']")) {
+          setSourceOpen(false);
+        }
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [sourceOpen]);
+  
   const isCached = (availableDates ?? []).includes(date);
   const cachedCount = (availableDates ?? []).length;
   const totalCount = (remoteDates ?? []).length;
+  
+  const sourceInfo = getSourceInfo(source);
   
   return (
     <div style={{
@@ -47,7 +69,7 @@ export default function TopBar({
       background: theme.bg, backdropFilter: "blur(12px)",
       borderBottom: `1px solid ${theme.border}`,
       display: "flex", alignItems: "center",
-      paddingLeft: 18, paddingRight: 18, gap: 16,
+      paddingLeft: 18, paddingRight: 18, gap: 12,
       zIndex: theme.z.chrome,
       fontFamily: theme.fontFamily,
       color: theme.text,
@@ -55,6 +77,7 @@ export default function TopBar({
       {/* Logo */}
       <div style={{
         display: "flex", alignItems: "center", gap: 10,
+        flexShrink: 0,
       }}>
         <div style={{
           width: 28, height: 28, borderRadius: "50%",
@@ -68,8 +91,50 @@ export default function TopBar({
           color: theme.textMuted,
           fontWeight: theme.fwMedium,
         }}>
-          UWA · 500m ROMS
+          Ocean Data Visualisation
         </div>
+      </div>
+      
+      {/* ⭐ 数据源切换按钮 */}
+      <div style={{ position: "relative" }} ref={sourceBtnRef}>
+        <button
+          onClick={() => !switchingSource && setSourceOpen(o => !o)}
+          disabled={switchingSource}
+          style={{
+            display: "flex", alignItems: "center", gap: 8,
+            padding: "5px 10px", height: 24,
+            background: sourceOpen ? theme.bgActive : theme.bgHover,
+            border: `1px solid ${sourceOpen ? theme.accent : theme.borderSoft}`,
+            borderRadius: theme.radiusS,
+            cursor: switchingSource ? "wait" : "pointer",
+            color: theme.text,
+            fontFamily: "inherit",
+            fontSize: theme.fsSmall,
+            opacity: switchingSource ? 0.6 : 1,
+            transition: "all 150ms",
+          }}
+          title="Switch data source"
+        >
+          <Layers size={12} color={theme.accent} strokeWidth={2} />
+          <span style={{ fontWeight: theme.fwMedium }}>
+            {sourceInfo.name}
+          </span>
+          <span style={{ color: theme.textDim, fontSize: 10 }}>
+            {sourceInfo.resolution}
+          </span>
+          <ChevronDown size={12} color={theme.textMuted} />
+        </button>
+        
+        {sourceOpen && (
+          <SourcePopover
+            selectedSource={source}
+            switching={switchingSource}
+            onChange={(s) => {
+              onSourceChange(s);
+              setSourceOpen(false);
+            }}
+          />
+        )}
       </div>
       
       {/* 中间留白 */}
@@ -79,18 +144,18 @@ export default function TopBar({
       <div style={{ position: "relative" }} ref={dateBtnRef}>
         <button
           onClick={() => setDateOpen(o => !o)}
-          disabled={switchingDate}
+          disabled={switchingDate || switchingSource}
           style={{
             display: "flex", alignItems: "center", gap: 8,
             padding: "5px 10px", height: 24,
             background: dateOpen ? theme.bgActive : theme.bgHover,
             border: `1px solid ${dateOpen ? theme.accent : theme.borderSoft}`,
             borderRadius: theme.radiusS,
-            cursor: switchingDate ? "wait" : "pointer",
+            cursor: (switchingDate || switchingSource) ? "wait" : "pointer",
             color: theme.text,
             fontFamily: "inherit",
             fontSize: theme.fsSmall,
-            opacity: switchingDate ? 0.6 : 1,
+            opacity: (switchingDate || switchingSource) ? 0.6 : 1,
             transition: "all 150ms",
           }}
         >

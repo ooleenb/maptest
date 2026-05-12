@@ -5,7 +5,7 @@
  * 点击采样后弹出的小卡片。深色风格,克制的尺寸。
  */
 
-import React from "react";
+import React, { useState } from "react";
 import { X } from "lucide-react";
 import { theme } from "../theme.js";
 
@@ -20,6 +20,10 @@ const TITLES = {
 export default function PointPopup({
   point, screenPos, variable, unit, onClose,
 }) {
+  // ⭐ 用 React state 控制 hover, 而不是直接操作 DOM 样式
+  //    (避免 lucide 的 currentColor 继承在某些渲染路径下失效)
+  const [closeHover, setCloseHover] = useState(false);
+  
   return (
     <div style={{
       position: "absolute",
@@ -40,27 +44,30 @@ export default function PointPopup({
         position: "relative",
         color: theme.text,
       }}>
+        {/* ⭐ 关闭按钮: 明确 X 颜色 + 微妙背景, 不依赖 currentColor 继承 */}
         <button
           onClick={onClose}
+          onMouseEnter={() => setCloseHover(true)}
+          onMouseLeave={() => setCloseHover(false)}
           style={{
             position: "absolute", top: 6, right: 6,
-            width: 20, height: 20,
-            border: "none", background: "transparent",
-            color: theme.textDim,
+            width: 22, height: 22,
+            border: "none",
+            background: closeHover ? theme.bgHover : "rgba(255,255,255,0.06)",
             cursor: "pointer",
             display: "flex", alignItems: "center", justifyContent: "center",
-            borderRadius: theme.radiusS,
+            borderRadius: "50%",
+            transition: "background 120ms",
+            padding: 0,
           }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = theme.bgHover;
-            e.currentTarget.style.color = theme.text;
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = "transparent";
-            e.currentTarget.style.color = theme.textDim;
-          }}
+          aria-label="Close"
         >
-          <X size={12}/>
+          {/* ⭐ 直接给 X 传 color prop, 不依赖 button 的 color CSS 继承 */}
+          <X
+            size={14}
+            strokeWidth={2.2}
+            color={closeHover ? theme.text : theme.textMuted}
+          />
         </button>
         
         <div style={{
@@ -69,7 +76,7 @@ export default function PointPopup({
           color: theme.textDim,
           letterSpacing: 0.6,
           marginBottom: 4,
-          paddingRight: 16,
+          paddingRight: 24,
         }}>
           {TITLES[variable] ?? variable.toUpperCase()}
         </div>

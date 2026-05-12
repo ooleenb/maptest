@@ -3,7 +3,13 @@
  * ============================
  * 
  * 底部 54px 时间轴 (windy 风格)。
- * 包含: 大播放按钮 + 当前时间显示 + 时间滑块 + 速度控制。
+ * 包含: 大播放按钮 + 当前时间显示 (AWST + UTC) + 时间滑块 + 速度控制。
+ * 
+ * 关于时区:
+ * --------
+ * - ROMS 数据存储用 UTC (海洋学标准)
+ * - 进度条的滑块值 hourFloat ∈ [0, 23] 对应数据集里这一天的整点帧 (UTC 整点)
+ * - 显示给用户用 AWST (UTC+8) 直观, 同时副标显示 UTC 便于对照进度条刻度
  */
 
 import React from "react";
@@ -13,14 +19,14 @@ import { theme } from "../theme.js";
 export default function BottomTimebar({
   hourFloat,
   setHourFloat,
-  times,             // ISO string array
+  times,             // ISO string array (UTC)
   maxHour,           // 通常 23
   isPlaying,
   togglePlay,
   playbackSpeed,
   setPlaybackSpeed,
 }) {
-  const currentTimeLabel = formatTime(times, hourFloat);
+  const { awst: awstLabel, utc: utcLabel } = formatTime(times, hourFloat);
   
   return (
     <div style={{
@@ -65,8 +71,8 @@ export default function BottomTimebar({
         )}
       </button>
       
-      {/* 当前时间 */}
-      <div style={{ width: 160, flexShrink: 0 }}>
+      {/* 当前时间 (AWST 主显示, UTC 副显示) */}
+      <div style={{ width: 180, flexShrink: 0 }}>
         <div style={{
           fontSize: 9, color: theme.textDim, letterSpacing: 0.5,
           fontWeight: theme.fwMedium,
@@ -77,8 +83,17 @@ export default function BottomTimebar({
           fontSize: theme.fsValue, fontWeight: theme.fwMedium,
           color: theme.text, marginTop: 2,
           fontVariantNumeric: "tabular-nums",
+          lineHeight: 1.1,
         }}>
-          {currentTimeLabel}
+          {awstLabel}
+        </div>
+        {/* ⭐ UTC 副显示, 与进度条刻度对应 */}
+        <div style={{
+          fontSize: 9, color: theme.textDim,
+          fontVariantNumeric: "tabular-nums",
+          marginTop: 1,
+        }}>
+          {utcLabel} UTC
         </div>
       </div>
       
@@ -97,7 +112,7 @@ export default function BottomTimebar({
           }}
         />
         
-        {/* 刻度 */}
+        {/* 刻度 (UTC 小时) */}
         <div style={{
           position: "absolute", top: 22, left: 0, right: 0,
           display: "flex", justifyContent: "space-between",
@@ -105,7 +120,7 @@ export default function BottomTimebar({
           pointerEvents: "none",
           fontVariantNumeric: "tabular-nums",
         }}>
-          <span>00:00</span>
+          <span>00 UTC</span>
           <span>03</span>
           <span>06</span>
           <span>09</span>
@@ -113,7 +128,7 @@ export default function BottomTimebar({
           <span>15</span>
           <span>18</span>
           <span>21</span>
-          <span>23:59</span>
+          <span>23</span>
         </div>
       </div>
       
@@ -156,8 +171,9 @@ export default function BottomTimebar({
 }
 
 
+// 返回 { awst, utc } 双标签
 function formatTime(times, hourFloat) {
-  if (!times || !times.length) return "—";
+  if (!times || !times.length) return { awst: "—", utc: "" };
   
   const iLow = Math.floor(hourFloat);
   const iHigh = Math.min(iLow + 1, times.length - 1);
@@ -165,12 +181,13 @@ function formatTime(times, hourFloat) {
   
   const tLow = new Date(times[iLow]);
   const tHigh = new Date(times[iHigh]);
-  if (Number.isNaN(tLow.getTime())) return "—";
+  if (Number.isNaN(tLow.getTime())) return { awst: "—", utc: "" };
   
   const tMs = tLow.getTime() + (tHigh.getTime() - tLow.getTime()) * frac;
   const t = new Date(tMs);
   
-  return t.toLocaleString("en-AU", {
+  // AWST: 完整日期时间 (主显示)
+  const awst = t.toLocaleString("en-AU", {
     month: "short",
     day: "numeric",
     year: "numeric",
@@ -179,4 +196,14 @@ function formatTime(times, hourFloat) {
     hour12: false,
     timeZone: "Australia/Perth",
   }).replace(",", " ·");
+  
+  // UTC: 只显示小时:分钟 (副显示, 主要用来对应进度条刻度)
+  const utc = t.toLocaleString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  });
+  
+  return { awst, utc };
 }
