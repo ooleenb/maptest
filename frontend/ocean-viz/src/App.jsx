@@ -43,18 +43,27 @@ const SLOW_LOAD_THRESHOLD_MS = 2000;
 const MAX_HOUR = 23;
 
 
+// ⭐ CARTO Voyager: 比 OSM 更克制的彩色底图
+//    - 道路浅灰、绿地淡黄绿、字体小而清晰
+//    - 完全免费, 无 API key
+//    - 4 个 subdomain (a-d) 用于并行下载, 比单个 OSM 服务器快很多
 const mapStyle = {
   version: 8,
   sources: {
-    osm: {
+    basemap: {
       type: "raster",
-      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+      tiles: [
+        "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+        "https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+        "https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+        "https://d.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+      ],
       tileSize: 256,
-      attribution: "© OpenStreetMap contributors",
+      attribution: "© OpenStreetMap contributors, © CARTO",
     },
   },
   layers: [
-    { id: "osm-base", type: "raster", source: "osm", minzoom: 0, maxzoom: 19 },
+    { id: "basemap", type: "raster", source: "basemap", minzoom: 0, maxzoom: 19 },
   ],
 };
 
@@ -129,11 +138,6 @@ export default function App() {
     setPopupScreenPos(null);
     
     // ⭐ 粒子彻底重置
-    // 1. 取消正在跑的 RAF (cleanup 会因为 simulatorReadyToken 重启而被触发)
-    // 2. 清空展示中的粒子段
-    // 3. simulator 实例置 null (下面 useEffect 看到 null + 新 grid 会重建)
-    // 4. bump token 让 RAF useEffect 重新跑(此时 simulatorRef.current = null,
-    //    进入提前 return 分支, 安全停止)
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
@@ -148,7 +152,7 @@ export default function App() {
     
     // 切日期到 fallback (datesIndex 加载完会自动跳到最新一天)
     setDate(FALLBACK_DATE);
-    autoPickedRef.current = false;   // 新源, 允许下次再自动跳一次
+    autoPickedRef.current = false;
     
     // 重置数据
     setGrid(null);
@@ -194,14 +198,13 @@ export default function App() {
     }
     loadInitial();
     return () => { cancelled = true; };
-  }, [source]);   // ⭐ 依赖 source
+  }, [source]);
   
   
   // ⭐ datesIndex 到位时, 自动跳到 remote 列表里的"最新一天"。
-  //    只在每次切源后跑一次 (autoPickedRef 跟踪), 不会覆盖用户之后的手动选择。
   useEffect(() => {
-    if (autoPickedRef.current) return;            // 这次源已经跳过了
-    if (!datesIndex?.remote?.length) return;      // 还没数据
+    if (autoPickedRef.current) return;
+    if (!datesIndex?.remote?.length) return;
     
     const latest = datesIndex.remote[datesIndex.remote.length - 1];
     console.log(`[App] Auto-picking latest date for ${source}: ${latest}`);
@@ -247,9 +250,6 @@ export default function App() {
   
   
   // ⭐ CWA 性能优化: 大网格 (282K cells) 不做小时间插值
-  //    Perth: 用 hourFloat 保持丝滑视觉
-  //    CWA:   用整数 hour, 每整点切换 (24 次/天 vs 60 Hz)
-  //           useMemo 重算从 ~60 次/秒 降到 ~1 次/秒
   const effectiveHour = source === "cwa" ? Math.floor(hourFloat) : hourFloat;
   
   const coloredCells = useMemo(() => {
@@ -289,9 +289,6 @@ export default function App() {
   
   
   // ⭐ 每个数据源用合适的拖尾长度
-  //    Perth 范围小, 40 步够长视觉; 
-  //    CWA 范围大 (~10×), 拖尾相对短, 但 60 步是性能和视觉的折衷
-  //    (LineLayer segments = particleCount × trailLength, 关键性能项)
   const trailLengthForSource = source === "cwa" ? 60 : 40;
   
   useEffect(() => {
@@ -305,9 +302,9 @@ export default function App() {
       simulatorRef.current = new ParticleSimulator({
         uvFrame,
         bounds: grid.bounds,
-        oceanCells: grid.oceanCells,        // ⭐ 传真实海洋格子列表
+        oceanCells: grid.oceanCells,
         nParticles: particleCount,
-        trailLength: trailLengthForSource,  // ⭐ 按源设置拖尾
+        trailLength: trailLengthForSource,
       });
     } else {
       simulatorRef.current.reset(uvFrame, grid.bounds, grid.oceanCells);
@@ -343,7 +340,6 @@ export default function App() {
       return;
     }
     const animate = (timestamp) => {
-      // ⭐ 防护: simulator 可能在 RAF 跑的途中被切源置 null
       const sim = simulatorRef.current;
       if (!sim) {
         animationFrameRef.current = null;
@@ -478,7 +474,6 @@ export default function App() {
         <Map ref={mapRef} mapStyle={mapStyle} reuseMaps />
       </DeckGL>
       
-      {/* ⭐ TopBar 现在永远显示 (即使数据还在加载也能让用户切回源) */}
       <TopBar
         source={source}
         onSourceChange={handleSourceChange}
