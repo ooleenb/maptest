@@ -61,3 +61,12 @@ desktop.ini
 # ============================================================
 # 不忽略 Dockerfile 和 compose 文件本身
 # 只忽略 docker 运行时的 volume 临时数据 (如有)
+backend/read_test_wa.py
+backend/read_test.py
+backend/read_test.py
+frontend/ocean-viz/test-data.html
+frontend/ocean-viz/test-gpu.html
+frontend/ocean-viz/src/components/GPUParticleLayer.jsx
+frontend/ocean-viz/src/render/gpuParticles/glUtils.js
+frontend/ocean-viz/src/render/gpuParticles/GPUParticleSystem.js
+frontend/ocean-viz/src/render/gpuParticles/shaders.js
