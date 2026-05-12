@@ -13,7 +13,7 @@ Supervised by A/Prof Ivica Janekovic.
 Prerequisite: Have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running.
 
 ```bash
-git clone https://github.com/ooleenb/MapTest.git
+git clone https://github.com/ooleenb/ocean-viz.git
 cd MapTest
 docker-compose up
 ```
