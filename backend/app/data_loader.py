@@ -8,21 +8,11 @@ data_loader.py
 ---------
 - 所有与"取数据"相关的逻辑集中在这一个文件里
 - 上层代码 (prep_day.py / api.py) 不需要关心 OPeNDAP URL、变量名、时间索引等细节
-- 通过 .ncml 聚合视图访问连续多天数据,而不是按日打开单个 .nc 文件
-- 用 dask 做懒加载,只把"实际要用的那一帧"读入内存,而不是把整个 5 个月数据下载下来
-- 内置重试机制,应对偶尔卡顿的 OPeNDAP 网络
-
-使用示例:
----------
-    from data_loader import ROMSDataSource
-    
-    src = ROMSDataSource("perth")
-    frame = src.get_frame("2026-03-11", hour=13)
-    print(frame.temp.shape)           # (259, 129)
-    
-    src_cwa = ROMSDataSource("cwa")
-    frame_cwa = src_cwa.get_frame("2026-03-11", hour=13)
-    print(frame_cwa.temp.shape)       # (640, 480)
+- 支持两种访问模式:
+    "aggregated": 一个 ncml URL 提供整年数据 (Perth/CWA ROMS)
+    "per_day":    每天一个单独的 .nc 文件 (WRF)
+- 不同数据源的实际变量名可能不同 (例如 ROMS 是 temp_sur, WRF 是 Tair),
+  通过 var_map 配置统一映射, 上层代码看到的永远是 temp/salt/zeta/u/v
 
 依赖:
 -----
@@ -57,27 +47,72 @@ if not logger.handlers:
 # ============================================================
 # 数据源配置
 # ============================================================
-# Perth 和 CWA 的 qck 数据集使用相同的 surface-only 变量命名:
-#   temp_sur, salt_sur, u_sur_eastward, v_sur_northward, zeta
-# 所以新增数据源只需要换 URL,变量名一致。
+# 每个源用统一的接口暴露 (temp/salt/zeta/u/v + time_dim),
+# 通过 var_map 把内部统一名映射到该数据集真实的变量名。
+#
+# access_mode 决定怎么打开数据:
+#   "aggregated": 用 ncml_url, 一个句柄管所有日期 (适合 Perth/CWA)
+#   "per_day":    用 day_url_pattern.format(ymd="20260516") 按需打开单天文件 (适合 WRF)
 DATA_SOURCES = {
     "perth": {
         "name": "Perth waters 500m ROMS",
-        # .ncml 聚合 URL —— 连续 5 个月数据
+        "kind": "ocean",
+        "access_mode": "aggregated",
         "ncml_url": "http://boreas.mywire.org:8080/thredds/dodsC/perthqck/perth_qck_2026.ncml",
         "resolution_m": 500,
         "time_dim": "ocean_time",
+        # ROMS surface 变量
+        "var_map": {
+            "temp": "temp_sur",
+            "salt": "salt_sur",
+            "zeta": "zeta",
+            "u":    "u_sur_eastward",
+            "v":    "v_sur_northward",
+        },
     },
     "cwa": {
         "name": "Central WA ~2km ROMS",
-        # ⚠️ URL 命名是 misleading 的:
-        # 文件名带 "_202601" 看起来只是一月份, 但实际是整年的聚合数据
-        # (验证: ocean_time 维度有 3288 时步, 137 天 × 24 小时 = 2026-01 到 2026-05)
-        # 真正一月份命名的 cwa_qck_2026.ncml 反而是 grid 文件 (静态网格定义),
-        # 由 grid_meta.py 独立使用。
+        "kind": "ocean",
+        "access_mode": "aggregated",
+        # ⚠️ 命名 misleading: cwa_qck_202601.ncml 其实是全年聚合 (137 天)
+        # 真正一月份命名的 cwa_qck_2026.ncml 反而是 grid 文件
         "ncml_url": "http://boreas.mywire.org:8080/thredds/dodsC/cwaqck/cwa_qck_202601.ncml",
         "resolution_m": 2000,
         "time_dim": "ocean_time",
+        "var_map": {
+            "temp": "temp_sur",
+            "salt": "salt_sur",
+            "zeta": "zeta",
+            "u":    "u_sur_eastward",
+            "v":    "v_sur_northward",
+        },
+    },
+    "wrf": {
+        "name": "WRF d02 atmospheric model",
+        "kind": "atmosphere",
+        "access_mode": "per_day",
+        # 单天文件 URL 模板, {ymd} 替换为 YYYYMMDD
+        "day_url_pattern": "http://boreas.mywire.org:8080/thredds/dodsC/WRF2026/wrf_roms_d02_{ymd}.nc",
+        # 数据集时间范围 (硬编码; per_day 模式没有 ncml 给我们 list,
+        # 这是为了让 list_available_dates() 不需要扫描整个 catalog)
+        # 实际可用日期可能更窄: 文件存在与否在打开时才知道
+        "date_range_start": "2026-01-01",
+        "date_range_end":   "2026-05-17",
+        "resolution_m": 2000,  # WRF d02 大约 2km
+        "time_dim": "time",     # WRF 用 'time', ROMS 用 'ocean_time'
+        # ⭐ WRF 是大气模型, 把大气变量"伪装"成 ROMS 的标量名
+        #    这样前端代码完全复用, 用户看到的:
+        #      "temp"  = 气温 (Tair, °C)
+        #      "salt"  = 气压 (Pair, mbar) - 单位完全不同, 但能可视化
+        #      "zeta"  = 湿度 (Qair, %)
+        #      u/v     = 风速分量 (Uwind, Vwind, m/s)
+        "var_map": {
+            "temp": "Tair",
+            "salt": "Pair",
+            "zeta": "Qair",
+            "u":    "Uwind",
+            "v":    "Vwind",
+        },
     },
 }
 
@@ -88,12 +123,6 @@ DATA_SOURCES = {
 def np_datetime_to_py(np_time: np.datetime64) -> datetime:
     """
     把 numpy datetime64 (纳秒精度) 转成 python datetime (微秒精度,UTC)。
-    
-    为什么需要这个函数:
-    -----------------
-    numpy 的 datetime64[ns] 转字符串会带 9 位小数 (纳秒),
-    但 python 标准库 datetime.fromisoformat() 在 3.11 之前
-    最多只接受 6 位小数 (微秒),所以直接转字符串会报错。
     """
     py_dt = np_time.astype('datetime64[s]').astype(datetime)
     return py_dt.replace(tzinfo=timezone.utc)
@@ -103,22 +132,8 @@ def np_datetime_to_py(np_time: np.datetime64) -> datetime:
 # 工具函数: 哨兵值清洗
 # ============================================================
 def _sanitize(arr: np.ndarray, threshold: float = 1e30) -> np.ndarray:
-    """
-    把数组里的"哨兵值"(ROMS 的 _FillValue, 通常是 1e37)替换成 NaN。
-    
-    为什么需要:
-    ---------
-    某些 OPeNDAP 数据集 (例如 CWA) 的 _FillValue 没被 xarray 自动 mask 掉,
-    导致 zeta/temp 等场出现 1e37 这种极端值。后续 PNG 编码、配色范围计算
-    都会被这种值污染 (例如颜色范围被拉到 0 ~ 1e37,所有合理数据挤成一片)。
-    
-    Perth 没出现这问题, CWA 偶尔有, 不管哪个都过滤一遍是最稳的策略。
-    
-    阈值 1e30 是因为合理的物理量都不会超过这个 (温度 0~30, 流速 0~5,
-    高度 ±10 米, 盐度 0~40). 任何 > 1e30 几乎肯定是哨兵。
-    """
+    """把数组里的"哨兵值" (例如 1e37) 替换成 NaN。"""
     arr = arr.astype(np.float32, copy=False)
-    # 任何绝对值超过阈值的都视为无效
     invalid = np.abs(arr) > threshold
     if np.any(invalid):
         arr = np.where(invalid, np.nan, arr).astype(np.float32)
@@ -126,17 +141,27 @@ def _sanitize(arr: np.ndarray, threshold: float = 1e30) -> np.ndarray:
 
 
 # ============================================================
+# 工具函数: 日期范围生成
+# ============================================================
+def _generate_date_range(start: str, end: str) -> list[str]:
+    """生成 [start, end] 之间所有日期的 YYYY-MM-DD 字符串列表。"""
+    from datetime import date as date_cls, timedelta
+    sd = date_cls.fromisoformat(start)
+    ed = date_cls.fromisoformat(end)
+    dates = []
+    cur = sd
+    while cur <= ed:
+        dates.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return dates
+
+
+# ============================================================
 # 数据帧的标准结构
 # ============================================================
 @dataclass
 class FrameData:
-    """
-    单个时间点的所有变量,组织成一个统一的结构。
-    
-    所有 2D 数组的 shape 都是 (eta_rho, xi_rho):
-        Perth: (259, 129)
-        CWA:   (640, 480)
-    """
+    """单个时间点的所有变量。"""
     time: datetime
     time_index: int
     
@@ -156,21 +181,14 @@ class FrameData:
 # ============================================================
 class ROMSDataSource:
     """
-    ROMS 数据源的统一访问接口。
+    数据源的统一访问接口 (尽管叫 ROMSDataSource, 也支持 WRF 等非 ROMS 数据)。
     
-    一个实例对应一个数据源(perth / cwa / ...)。
-    内部维护一个长期打开的 xarray Dataset 句柄,通过 dask 懒加载,
-    只在 .get_frame() 时才真正下载需要的那一帧数据。
+    内部根据 access_mode 走不同路径:
+    - aggregated: 维护一个长期 xr.Dataset 句柄
+    - per_day:    每次 get_day 时打开/关闭单天文件
     """
     
     def __init__(self, source_name: str = "perth", lazy_open: bool = True):
-        """
-        参数:
-        -----
-        source_name: 数据源名字,必须是 DATA_SOURCES 里的 key
-        lazy_open:   True = 立刻打开 .ncml 句柄(可能慢几秒)
-                     False = 第一次 get_frame 时再打开
-        """
         if source_name not in DATA_SOURCES:
             available = ", ".join(DATA_SOURCES.keys())
             raise ValueError(
@@ -179,24 +197,56 @@ class ROMSDataSource:
         
         self.source_name = source_name
         self.config = DATA_SOURCES[source_name]
-        self._dataset: Optional[xr.Dataset] = None
+        self.access_mode = self.config.get("access_mode", "aggregated")
+        self._dataset: Optional[xr.Dataset] = None  # 仅 aggregated 模式用
+        self._dataset_opened_at: float = 0.0  # 句柄打开时间戳, 用于 TTL
+        # TTL: OPeNDAP 句柄默认 5 分钟过期, 之后下次访问自动重新打开
+        # (源服务器可能在背后更新, 比如新一天的数据出来了)
+        self._dataset_ttl: float = 300.0  # 5 分钟
         
-        if not lazy_open:
+        if not lazy_open and self.access_mode == "aggregated":
             self._open()
     
     # ------------------------------------------------------------
-    # 内部: 打开 .ncml 句柄
+    # aggregated 模式: 打开长期句柄
     # ------------------------------------------------------------
-    def _open(self, max_retries: int = 3, retry_delay: float = 2.0) -> xr.Dataset:
-        """
-        打开 .ncml 数据集。带重试机制,因为 OPeNDAP 偶尔会临时卡顿。
+    def _open(
+        self,
+        max_retries: int = 3,
+        retry_delay: float = 2.0,
+        force_refresh: bool = False,
+    ) -> xr.Dataset:
+        """打开 .ncml 数据集 (仅 aggregated 模式).
         
-        关键参数:
-        - chunks={}: 启用 dask 懒加载,默认每个变量切成一块。
-        - decode_times=True: 把 ocean_time 自动解析成 datetime64
+        Args:
+            force_refresh: 如果 True, 即便句柄存在也强制关闭并重开.
+                          用于响应"用户请求 dates 列表"等需要新鲜数据的场景.
         """
-        if self._dataset is not None:
+        if self.access_mode != "aggregated":
+            raise RuntimeError(
+                f"_open() called on per_day source {self.source_name!r}. "
+                f"Use _open_day(date) instead."
+            )
+        
+        # TTL 检查: 句柄超过生存时间则视为过期
+        now = time.time()
+        is_stale = (
+            self._dataset is not None
+            and (now - self._dataset_opened_at) > self._dataset_ttl
+        )
+        
+        if self._dataset is not None and not force_refresh and not is_stale:
             return self._dataset
+        
+        # 需要重开: 先 close 旧的
+        if self._dataset is not None:
+            reason = "force_refresh" if force_refresh else f"stale ({now - self._dataset_opened_at:.0f}s old)"
+            logger.info(f"Refreshing dataset ({self.source_name}): {reason}")
+            try:
+                self._dataset.close()
+            except Exception:
+                pass
+            self._dataset = None
         
         url = self.config["ncml_url"]
         logger.info(f"Opening dataset ({self.source_name}): {url}")
@@ -205,11 +255,7 @@ class ROMSDataSource:
         for attempt in range(1, max_retries + 1):
             try:
                 t0 = time.time()
-                ds = xr.open_dataset(
-                    url,
-                    chunks={},
-                    decode_times=True,
-                )
+                ds = xr.open_dataset(url, chunks={}, decode_times=True)
                 elapsed = time.time() - t0
                 
                 times = ds[self.config["time_dim"]].values
@@ -220,12 +266,11 @@ class ROMSDataSource:
                 )
                 
                 self._dataset = ds
+                self._dataset_opened_at = time.time()
                 return ds
             except Exception as e:
                 last_error = e
-                logger.warning(
-                    f"  Attempt {attempt}/{max_retries} failed: {e}"
-                )
+                logger.warning(f"  Attempt {attempt}/{max_retries} failed: {e}")
                 if attempt < max_retries:
                     time.sleep(retry_delay)
         
@@ -235,113 +280,78 @@ class ROMSDataSource:
         )
     
     # ------------------------------------------------------------
+    # per_day 模式: 按日期打开单天文件
+    # ------------------------------------------------------------
+    def _open_day(self, date: str, max_retries: int = 3) -> xr.Dataset:
+        """打开某天的单文件 (仅 per_day 模式). 调用方负责 close()."""
+        if self.access_mode != "per_day":
+            raise RuntimeError(
+                f"_open_day() called on aggregated source {self.source_name!r}."
+            )
+        
+        # date 'YYYY-MM-DD' -> ymd 'YYYYMMDD'
+        ymd = date.replace("-", "")
+        url = self.config["day_url_pattern"].format(ymd=ymd)
+        logger.info(f"Opening day file ({self.source_name} {date}): {url}")
+        
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                t0 = time.time()
+                ds = xr.open_dataset(url, chunks={}, decode_times=True)
+                elapsed = time.time() - t0
+                logger.info(f"  Day file opened in {elapsed:.1f}s")
+                return ds
+            except Exception as e:
+                last_error = e
+                logger.warning(f"  Attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    time.sleep(2.0)
+        
+        raise RuntimeError(
+            f"Failed to open {url} after {max_retries} attempts. "
+            f"Last error: {last_error}"
+        )
+    
+    # ------------------------------------------------------------
     # 公共方法: 列出可用日期
     # ------------------------------------------------------------
-    def list_available_dates(self) -> list[str]:
+    def list_available_dates(self, force_refresh: bool = False) -> list[str]:
+        """返回数据集里所有可用的日期 (YYYY-MM-DD 格式).
+        
+        Args:
+            force_refresh: 若 True, 重新连 OPeNDAP 拿最新时间维度
+                          (用于前端请求"最新可用日期"的情况)
         """
-        返回数据集里所有可用的日期(去重,YYYY-MM-DD 格式)。
-        """
-        ds = self._open()
-        times = ds[self.config["time_dim"]].values
-        date_strs = sorted({
-            str(t)[:10]
-            for t in times
-        })
-        return date_strs
+        if self.access_mode == "aggregated":
+            # 扫 ncml 时间维度
+            ds = self._open(force_refresh=force_refresh)
+            times = ds[self.config["time_dim"]].values
+            return sorted({str(t)[:10] for t in times})
+        else:
+            # per_day 模式: 用配置里的日期范围生成
+            # (实际文件可能没全, 但 list 用途主要是给前端日期选择器,
+            # 缺失日期由 _open_day 打开时报错处理)
+            return _generate_date_range(
+                self.config["date_range_start"],
+                self.config["date_range_end"],
+            )
     
     # ------------------------------------------------------------
-    # 公共方法: 取某天某小时的单帧
-    # ------------------------------------------------------------
-    def get_frame(
-        self,
-        date: str,
-        hour: int,
-    ) -> FrameData:
-        """
-        取某一天某一小时的所有变量,打包成 FrameData。
-        """
-        if not (0 <= hour <= 23):
-            raise ValueError(f"hour must be 0-23, got {hour}")
-        
-        ds = self._open()
-        time_dim = self.config["time_dim"]
-        
-        target_time = np.datetime64(f"{date}T{hour:02d}:00:00")
-        
-        all_times = ds[time_dim].values
-        matches = np.where(all_times == target_time)[0]
-        
-        if len(matches) == 0:
-            available_on_date = [
-                str(t) for t in all_times
-                if str(t).startswith(date)
-            ]
-            if not available_on_date:
-                raise ValueError(
-                    f"Date {date} not available. "
-                    f"Available range: {all_times[0]} to {all_times[-1]}"
-                )
-            else:
-                raise ValueError(
-                    f"Hour {hour} not available on {date}. "
-                    f"Available hours: {[t[11:13] for t in available_on_date]}"
-                )
-        
-        time_index = int(matches[0])
-        return self.get_frame_by_index(time_index)
-    
-    # ------------------------------------------------------------
-    # 公共方法: 按时间索引直接取
-    # ------------------------------------------------------------
-    def get_frame_by_index(self, time_index: int) -> FrameData:
-        """
-        直接通过整数索引取帧。比按日期/小时取快(省了查找步骤)。
-        """
-        ds = self._open()
-        time_dim = self.config["time_dim"]
-        
-        t0 = time.time()
-        snapshot = ds.isel({time_dim: time_index})
-        
-        needed_vars = ["temp_sur", "salt_sur", "u_sur_eastward",
-                       "v_sur_northward", "zeta"]
-        snapshot = snapshot[needed_vars].compute()
-        elapsed = time.time() - t0
-        
-        time_value = snapshot[time_dim].values
-        timestamp = np_datetime_to_py(time_value)
-        
-        logger.debug(
-            f"  Fetched frame [{time_index}] {timestamp.isoformat()} "
-            f"in {elapsed:.2f}s"
-        )
-        
-        return FrameData(
-            time=timestamp,
-            time_index=time_index,
-            temp=_sanitize(snapshot["temp_sur"].values),
-            salt=_sanitize(snapshot["salt_sur"].values),
-            zeta=_sanitize(snapshot["zeta"].values),
-            u=_sanitize(snapshot["u_sur_eastward"].values),
-            v=_sanitize(snapshot["v_sur_northward"].values),
-        )
-    
-    # ------------------------------------------------------------
-    # 公共方法: 取一整天的 24 帧(预处理主用法)
+    # 公共方法: 取一整天的 24 帧
     # ------------------------------------------------------------
     def get_day(self, date: str) -> list[FrameData]:
-        """
-        取某一天的全部 24 小时数据。
-        
-        实现细节(性能关键):
-        ------------------
-        ❌ 慢的写法: isel(time=[i, i+1, ..., i+23])  # list of indices
-        ✅ 快的写法: isel(time=slice(i, i+24))        # contiguous slice
-        
-        OPeNDAP 把 slice 合并成单次连续读取,比 24 个独立请求快几十倍。
-        """
+        """取某一天的全部 24 小时数据。"""
+        if self.access_mode == "aggregated":
+            return self._get_day_aggregated(date)
+        else:
+            return self._get_day_per_day(date)
+    
+    # -- aggregated 实现 --
+    def _get_day_aggregated(self, date: str) -> list[FrameData]:
         ds = self._open()
         time_dim = self.config["time_dim"]
+        var_map = self.config["var_map"]
         
         all_times = ds[time_dim].values
         day_mask = np.array([str(t).startswith(date) for t in all_times])
@@ -349,22 +359,16 @@ class ROMSDataSource:
         
         if len(day_indices) == 0:
             raise ValueError(f"No data found for date {date}")
-        
         if len(day_indices) != 24:
             logger.warning(
-                f"Expected 24 hours on {date}, got {len(day_indices)}. "
-                f"This is unusual—check the source data."
+                f"Expected 24 hours on {date}, got {len(day_indices)}."
             )
         
         start_idx = int(day_indices[0])
         end_idx = int(day_indices[-1]) + 1
-        
         expected = np.arange(start_idx, end_idx)
         if not np.array_equal(day_indices, expected):
-            logger.warning(
-                f"Day {date} has non-contiguous time indices, "
-                f"falling back to slower list-based loading"
-            )
+            logger.warning(f"Day {date} has non-contiguous indices")
             time_selector = day_indices.tolist()
         else:
             time_selector = slice(start_idx, end_idx)
@@ -375,45 +379,122 @@ class ROMSDataSource:
         )
         t0 = time.time()
         
-        needed_vars = ["temp_sur", "salt_sur", "u_sur_eastward",
-                       "v_sur_northward", "zeta"]
-        day_data = ds[needed_vars].isel({time_dim: time_selector}).load()
+        # 用 var_map 取真实变量名
+        real_names = [var_map["temp"], var_map["salt"], var_map["zeta"],
+                      var_map["u"], var_map["v"]]
+        day_data = ds[real_names].isel({time_dim: time_selector}).load()
         
         elapsed = time.time() - t0
         n_frames = len(day_indices)
         logger.info(
-            f"  Day loaded in {elapsed:.1f}s "
-            f"({elapsed / n_frames:.2f}s/frame)"
+            f"  Day loaded in {elapsed:.1f}s ({elapsed/n_frames:.2f}s/frame)"
         )
         
+        return self._build_frames(day_data, day_indices, time_dim, var_map)
+    
+    # -- per_day 实现 --
+    def _get_day_per_day(self, date: str) -> list[FrameData]:
+        ds = self._open_day(date)
+        time_dim = self.config["time_dim"]
+        var_map = self.config["var_map"]
+        
+        try:
+            n_times = ds.sizes[time_dim]
+            if n_times != 24:
+                logger.warning(f"Expected 24 hours, got {n_times}")
+            
+            t0 = time.time()
+            real_names = [var_map["temp"], var_map["salt"], var_map["zeta"],
+                          var_map["u"], var_map["v"]]
+            day_data = ds[real_names].load()
+            elapsed = time.time() - t0
+            logger.info(
+                f"  Day loaded in {elapsed:.1f}s ({elapsed/n_times:.2f}s/frame)"
+            )
+            
+            # per_day 模式下 index 是 0..23 (相对于本文件)
+            indices = list(range(n_times))
+            return self._build_frames(day_data, indices, time_dim, var_map)
+        finally:
+            ds.close()
+    
+    # -- 公共: 把 xarray 数据包装成 FrameData 列表 --
+    def _build_frames(self, day_data, indices, time_dim, var_map) -> list[FrameData]:
         frames = []
-        for i, idx in enumerate(day_indices):
+        for i, idx in enumerate(indices):
             time_value = day_data[time_dim].values[i]
             timestamp = np_datetime_to_py(time_value)
             
             frames.append(FrameData(
                 time=timestamp,
                 time_index=int(idx),
-                temp=_sanitize(day_data["temp_sur"].values[i]),
-                salt=_sanitize(day_data["salt_sur"].values[i]),
-                zeta=_sanitize(day_data["zeta"].values[i]),
-                u=_sanitize(day_data["u_sur_eastward"].values[i]),
-                v=_sanitize(day_data["v_sur_northward"].values[i]),
+                temp=_sanitize(day_data[var_map["temp"]].values[i]),
+                salt=_sanitize(day_data[var_map["salt"]].values[i]),
+                zeta=_sanitize(day_data[var_map["zeta"]].values[i]),
+                u=_sanitize(day_data[var_map["u"]].values[i]),
+                v=_sanitize(day_data[var_map["v"]].values[i]),
             ))
-        
         return frames
     
     # ------------------------------------------------------------
-    # 公共方法: 取整个数据集的全局统计(用于固定 colormap 范围)
+    # 公共方法: 取某天某小时的单帧
     # ------------------------------------------------------------
-    def get_global_stats(
-        self,
-        variable: str,
-        sample_step: int = 24,
-    ) -> dict:
-        """
-        扫描所有时间点,算某个变量的全局 min/max/分位数。
-        """
+    def get_frame(self, date: str, hour: int) -> FrameData:
+        """取某一天某一小时的单帧。"""
+        if not (0 <= hour <= 23):
+            raise ValueError(f"hour must be 0-23, got {hour}")
+        # 复用 get_day, 取第 hour 个
+        # (per_day 模式下 frame 索引就是 hour, aggregated 也是 0-23)
+        frames = self.get_day(date)
+        if hour >= len(frames):
+            raise ValueError(f"Hour {hour} not available on {date}")
+        return frames[hour]
+    
+    # ------------------------------------------------------------
+    # 公共方法: 按索引取 (aggregated only, 给上层 prep 用)
+    # ------------------------------------------------------------
+    def get_frame_by_index(self, time_index: int) -> FrameData:
+        """按时间索引直接取 (仅 aggregated 模式)."""
+        if self.access_mode != "aggregated":
+            raise RuntimeError(
+                f"get_frame_by_index() not supported in per_day mode. "
+                f"Use get_frame(date, hour) instead."
+            )
+        
+        ds = self._open()
+        time_dim = self.config["time_dim"]
+        var_map = self.config["var_map"]
+        
+        t0 = time.time()
+        snapshot = ds.isel({time_dim: time_index})
+        real_names = [var_map["temp"], var_map["salt"], var_map["zeta"],
+                      var_map["u"], var_map["v"]]
+        snapshot = snapshot[real_names].compute()
+        elapsed = time.time() - t0
+        
+        time_value = snapshot[time_dim].values
+        timestamp = np_datetime_to_py(time_value)
+        
+        return FrameData(
+            time=timestamp,
+            time_index=time_index,
+            temp=_sanitize(snapshot[var_map["temp"]].values),
+            salt=_sanitize(snapshot[var_map["salt"]].values),
+            zeta=_sanitize(snapshot[var_map["zeta"]].values),
+            u=_sanitize(snapshot[var_map["u"]].values),
+            v=_sanitize(snapshot[var_map["v"]].values),
+        )
+    
+    # ------------------------------------------------------------
+    # 公共方法: 取全局统计 (仅 aggregated 模式)
+    # ------------------------------------------------------------
+    def get_global_stats(self, variable: str, sample_step: int = 24) -> dict:
+        """扫描所有时间点, 算某个变量的全局 min/max/分位数."""
+        if self.access_mode != "aggregated":
+            raise RuntimeError(
+                "get_global_stats() only supported in aggregated mode"
+            )
+        
         ds = self._open()
         time_dim = self.config["time_dim"]
         n_times = len(ds[time_dim])
@@ -430,12 +511,8 @@ class ROMSDataSource:
         sampled = ds[variable].isel({time_dim: sample_selector}).load()
         values = sampled.values
         valid = values[np.isfinite(values)]
-        
         elapsed = time.time() - t0
-        logger.info(
-            f"  Stats computed in {elapsed:.1f}s "
-            f"({elapsed / n_samples:.2f}s/sample)"
-        )
+        logger.info(f"  Stats computed in {elapsed:.1f}s")
         
         return {
             "variable": variable,
@@ -448,7 +525,7 @@ class ROMSDataSource:
         }
     
     # ------------------------------------------------------------
-    # 析构: 关闭句柄
+    # 析构
     # ------------------------------------------------------------
     def close(self):
         if self._dataset is not None:
@@ -457,7 +534,8 @@ class ROMSDataSource:
             logger.info(f"Closed dataset: {self.source_name}")
     
     def __enter__(self):
-        self._open()
+        if self.access_mode == "aggregated":
+            self._open()
         return self
     
     def __exit__(self, *args):
@@ -469,17 +547,18 @@ class ROMSDataSource:
 # ============================================================
 if __name__ == "__main__":
     """
-    跑这个文件本身会执行一系列测试,验证数据访问层工作正常。
-    
     用法:
-        python data_loader.py              # 测试 perth (默认)
+        python data_loader.py              # 测试 perth
         python data_loader.py cwa          # 测试 cwa
+        python data_loader.py wrf          # 测试 wrf
     """
     import sys
     source = sys.argv[1] if len(sys.argv) > 1 else "perth"
     
     print("=" * 60)
     print(f"Testing ROMSDataSource ({source})")
+    print(f"  access_mode = {DATA_SOURCES[source].get('access_mode', 'aggregated')}")
+    print(f"  kind        = {DATA_SOURCES[source].get('kind', '?')}")
     print("=" * 60)
     
     with ROMSDataSource(source) as src:
@@ -490,29 +569,25 @@ if __name__ == "__main__":
         print(f"  First 3: {dates[:3]}")
         print(f"  Last 3:  {dates[-3:]}")
         
-        # 测试 2: 取单帧
-        test_date = dates[len(dates) // 2]
-        print(f"\n[Test 2] Get single frame ({test_date} 13:00)")
-        frame = src.get_frame(test_date, hour=13)
-        print(f"  Time: {frame.time.isoformat()}")
-        print(f"  Shape: {frame.shape}")
-        print(f"  temp range: {np.nanmin(frame.temp):.2f} ~ "
-              f"{np.nanmax(frame.temp):.2f} °C")
-        print(f"  salt range: {np.nanmin(frame.salt):.2f} ~ "
-              f"{np.nanmax(frame.salt):.2f}")
-        print(f"  u range:    {np.nanmin(frame.u):.3f} ~ "
-              f"{np.nanmax(frame.u):.3f} m/s")
-        print(f"  v range:    {np.nanmin(frame.v):.3f} ~ "
-              f"{np.nanmax(frame.v):.3f} m/s")
-        print(f"  zeta range: {np.nanmin(frame.zeta):.3f} ~ "
-              f"{np.nanmax(frame.zeta):.3f} m")
-        
-        # 测试 3: 取整天
-        print(f"\n[Test 3] Get full day ({dates[0]})")
-        day_frames = src.get_day(dates[0])
+        # 测试 2: 取整天 (per_day 模式下直接用 get_day)
+        # 选一个中间日期, 增加成功率
+        test_date = dates[len(dates) // 2] if src.access_mode == "aggregated" else "2026-05-16"
+        print(f"\n[Test 2] Get full day ({test_date})")
+        day_frames = src.get_day(test_date)
         print(f"  Got {len(day_frames)} frames")
         print(f"  First frame: {day_frames[0].time.isoformat()}")
         print(f"  Last frame:  {day_frames[-1].time.isoformat()}")
+        
+        # 测试 3: 检查中间一帧的数据范围
+        print(f"\n[Test 3] Mid-day frame stats (hour 13)")
+        if len(day_frames) > 13:
+            f = day_frames[13]
+            print(f"  Shape: {f.shape}")
+            print(f"  temp range: {np.nanmin(f.temp):.2f} ~ {np.nanmax(f.temp):.2f}")
+            print(f"  salt range: {np.nanmin(f.salt):.2f} ~ {np.nanmax(f.salt):.2f}")
+            print(f"  zeta range: {np.nanmin(f.zeta):.3f} ~ {np.nanmax(f.zeta):.3f}")
+            print(f"  u range:    {np.nanmin(f.u):.3f} ~ {np.nanmax(f.u):.3f}")
+            print(f"  v range:    {np.nanmin(f.v):.3f} ~ {np.nanmax(f.v):.3f}")
     
     print("\n" + "=" * 60)
     print("All tests passed ✓")

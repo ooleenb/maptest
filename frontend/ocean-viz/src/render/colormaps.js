@@ -5,11 +5,12 @@
  * 多 colormap 库 + 配色映射函数。
  * 
  * 包含的 colormap (来源):
- * - thermal:  cmocean.thermal   适合温度
- * - haline:   cmocean.haline    适合盐度
- * - balance:  cmocean.balance   适合双极性数据 (如 SSH, 有正负)
- * - viridis:  matplotlib        通用, 对色盲友好
- * - RdBu_r:   matplotlib        通用, 蓝-白-红
+ * - windyTemp: Windy.com / ECMWF-style 温度配色 (蓝→青→黄→红, 用于海面温度) ⭐ 新增
+ * - thermal:   cmocean.thermal   适合温度 (深紫→红→黄, 备选)
+ * - haline:    cmocean.haline    适合盐度
+ * - balance:   cmocean.balance   适合双极性数据 (如 SSH, 有正负)
+ * - viridis:   matplotlib        通用, 对色盲友好
+ * - RdBu_r:    matplotlib        通用, 蓝-白-红
  * 
  * 每个 colormap 是一个函数 (t: 0..1) → [r, g, b]
  */
@@ -61,6 +62,25 @@ function buildCssGradient(cmapFn) {
   }
   return `linear-gradient(to right, ${stops.join(", ")})`;
 }
+
+
+// ============================================================
+// Colormap 0: windyTemp - Windy.com / ECMWF 温度配色 ⭐ NEW
+// 蓝 → 青绿 → 黄 → 橙 → 红
+// 模仿 windy.com 的温度色带, 但优化到海面温度典型范围 (~12°C - 33°C)
+// 与 windy 的设计原则一致: 0°C 附近过渡到青色, 高温红色, 低温蓝色
+// ============================================================
+export const windyTemp = makeColormap([
+  { t: 0.00, color: [ 35, 100, 188] },  // 蓝   (冷)
+  { t: 0.12, color: [ 48, 146, 196] },  // 浅蓝
+  { t: 0.25, color: [ 85, 191, 184] },  // 青绿
+  { t: 0.40, color: [167, 219, 130] },  // 黄绿
+  { t: 0.55, color: [255, 234, 102] },  // 黄
+  { t: 0.70, color: [255, 184,  76] },  // 橘黄
+  { t: 0.83, color: [236, 114,  60] },  // 橙
+  { t: 0.93, color: [211,  56,  61] },  // 红橙
+  { t: 1.00, color: [167,  26,  72] },  // 深红 (热)
+]);
 
 
 // ============================================================
@@ -150,14 +170,22 @@ export const RdBu_r = makeColormap([
 
 // ============================================================
 // 注册表: name → {fn, css, label}
+// 顺序决定了 UI 里的展示顺序
 // ============================================================
 export const COLORMAPS = {
+  windyTemp: {
+    name: "windyTemp",
+    label: "Windy Temp",
+    fn: windyTemp,
+    css: buildCssGradient(windyTemp),
+    description: "Blue-cyan-yellow-red (Windy.com style, for SST)",
+  },
   thermal: {
     name: "thermal",
     label: "Thermal",
     fn: thermal,
     css: buildCssGradient(thermal),
-    description: "Black-purple-red-yellow (good for temperature)",
+    description: "Black-purple-red-yellow (cmocean, for temperature)",
   },
   haline: {
     name: "haline",
@@ -194,7 +222,7 @@ export const COLORMAPS = {
 // 每个变量的默认 colormap
 // ============================================================
 export const DEFAULT_COLORMAP = {
-  temp: "thermal",
+  temp: "windyTemp",   // ⭐ 改为 Windy 风格
   salt: "haline",
   zeta: "balance",
 };

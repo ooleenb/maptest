@@ -133,29 +133,18 @@ app = FastAPI(
 
 # CORS: 允许前端开发服务器访问
 # 部署时把 allow_origins 改成具体域名 (不要在生产用 ["*"])
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=[
-#         "http://localhost:5173",   # Vite 默认端口
-#         "http://localhost:5174",   # Vite 备用端口
-#         "http://127.0.0.1:5173",
-#         # 部署时加你的生产域名
-#     ],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
 app.add_middleware(
     CORSMiddleware,
-    # 开发期: 允许所有 localhost 端口和 127.0.0.1
-    # 部署时换成具体域名,例如 ["https://ocean-viz.example.com"]
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origins=[
+        "http://localhost:5173",   # Vite 默认端口
+        "http://localhost:5174",   # Vite 备用端口
+        "http://127.0.0.1:5173",
+        # 部署时加你的生产域名
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 # gzip 压缩 (大于 1KB 的响应自动压缩)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -348,6 +337,7 @@ async def get_grid_json(source: str):
 async def list_dates(
     source: str,
     range: str = Query("remote", pattern="^(remote|available|both)$"),
+    refresh: bool = Query(True, description="强制刷新 OPeNDAP 连接以拿到最新日期 (默认 True)"),
 ):
     """
     列出可用日期。
@@ -356,6 +346,9 @@ async def list_dates(
     - "remote":    OPeNDAP 数据集里所有的日期 (默认)
     - "available": 已经在本地预生成的日期
     - "both":      返回两个列表
+    
+    参数 `refresh`: 是否强制重连 OPeNDAP 拿最新数据 (默认 True).
+    设为 False 可以避免每次列日期都触发 OPeNDAP handshake (~1-2s).
     """
     _validate_source(source)
     
@@ -365,7 +358,7 @@ async def list_dates(
         src_handle = _data_sources.get(source)
         if src_handle:
             try:
-                result["remote"] = src_handle.list_available_dates()
+                result["remote"] = src_handle.list_available_dates(force_refresh=refresh)
             except Exception as e:
                 logger.error(f"Failed to list remote dates: {e}")
                 result["remote"] = []
