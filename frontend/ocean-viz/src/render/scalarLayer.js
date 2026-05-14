@@ -131,16 +131,30 @@ export function createScalarLayer({ id, coloredCells, updateTriggerKey }) {
 /**
  * 点击采样: 在原始网格上找最近 cell 的值。
  * 
- * 加了距离阈值: 如果点击位置距离最近 cell 超过 maxDistanceDeg 度,
- * 返回 null (避免点陆地/远海/世界另一边却拿到 Perth 海面值)。
+ * ⭐ 自适应距离阈值 (修复粗网格点击大量 "No data" 的 bug):
+ *   不再用写死的 maxDistanceDeg —— 那个值是给 Perth 500m 网格调的,
+ *   放到 2km 网格 (cwa / wrf_d01 / wrf_d02) 上, 点在格子边界附近就会
+ *   被误判成 "No data".
+ *   
+ *   现在的做法: 找到最近的 cell 后, 用【那个 cell 自己的尺寸】作为阈值
+ *   基准 —— 如果点到 cell 中心的距离 <= cell 对角线长度 (留足余量),
+ *   就认为点落在这个格子里, 采样有效. 不同分辨率的网格自动适配,
+ *   无需任何配置.
+ *   
+ *   仍然能正确返回 null 的情况: 点到了网格范围以外很远的地方
+ *   (比如世界另一边), 那时最近 cell 也在很远, 距离远超它的对角线.
  * 
- * Perth 网格分辨率约 500m ≈ 0.005°,
- * 我们用 0.012° (~1.3 km) 作为阈值: 略大于一个 cell, 但远比
- * "点到非海洋区域"那种 0.1° 以上的距离要小。
+ * @param {Array} oceanCells  网格 cell 列表, 每个有 polygon (4 角点)
+ * @param {Float32Array} frameData  当前帧标量数据
+ * @param {number} nXi  网格列数
+ * @param {number} lon, lat  点击的经纬度
+ * @param {number} [fallbackMaxDeg]  兜底阈值: 万一 cell 没有 polygon
+ *        信息时用 (正常情况用不到). 默认 0.05.
  */
-export function sampleAtPoint(oceanCells, frameData, nXi, lon, lat, maxDistanceDeg = 0.012) {
+export function sampleAtPoint(oceanCells, frameData, nXi, lon, lat, fallbackMaxDeg = 0.05) {
   let bestDist = Infinity;
   let bestValue = null;
+  let bestCell = null;
   
   for (let i = 0; i < oceanCells.length; i++) {
     const cell = oceanCells[i];
@@ -155,12 +169,29 @@ export function sampleAtPoint(oceanCells, frameData, nXi, lon, lat, maxDistanceD
       if (Number.isFinite(value)) {
         bestDist = dist;
         bestValue = value;
+        bestCell = cell;
       }
     }
   }
   
-  // ⭐ 距离阈值检查: 太远就当作无效
-  const maxDistSq = maxDistanceDeg * maxDistanceDeg;
+  if (bestCell == null) return null;
+  
+  // ⭐ 用最近 cell 自己的对角线长度作为距离阈值.
+  //   polygon[0] 和 polygon[2] 是对角的两个角点.
+  //   对角线长度 = 这个格子的"尺寸". 点到中心的距离只要不超过
+  //   对角线 (相当于格子半径的 ~2 倍, 余量充足), 就算落在格子内.
+  const p0 = bestCell.polygon[0];
+  const p2 = bestCell.polygon[2];
+  const diagDx = p2[0] - p0[0];
+  const diagDy = p2[1] - p0[1];
+  const diagLenSq = diagDx * diagDx + diagDy * diagDy;
+  
+  // 阈值: 优先用 cell 对角线; 万一 polygon 异常 (对角线为 0),
+  // 退回到 fallbackMaxDeg.
+  const maxDistSq = diagLenSq > 1e-12
+    ? diagLenSq
+    : fallbackMaxDeg * fallbackMaxDeg;
+  
   if (bestDist > maxDistSq) {
     return null;
   }
