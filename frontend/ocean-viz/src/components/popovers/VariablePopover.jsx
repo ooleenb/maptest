@@ -2,50 +2,125 @@
  * popovers/VariablePopover.jsx
  * ============================
  * 
- * 变量切换 popover (温度/盐度/SSH)。
- * 显示当前选中的变量,以及实时数据范围。
+ * 变量切换 popover。
+ * 
+ * ⭐ 变量列表是动态的: 根据当前数据源 (source) 显示不同的变量。
+ *    - ROMS 海洋源 (perth/cwa): 温度 / 盐度 / 海面高度
+ *    - WRF  大气源 (wrf_d01/d02): 气温 / 气压 / 湿度 / 降雨 / 云量
+ *    具体哪个源有哪些变量, 由 config.js 的 SOURCES[].variables 决定。
  */
 
 import React from "react";
-import { Thermometer, Droplet, Waves } from "lucide-react";
+import {
+  Thermometer, Droplet, Waves,
+  Gauge, CloudRain, Cloud,
+} from "lucide-react";
 import { theme, labelStyle } from "../../theme.js";
+import { getSourceVariables } from "../../data/config.js";
 
 
-const VARIABLE_OPTIONS = [
-  {
-    key: "temp",
+// ============================================================
+// 变量元信息表 (所有可能出现的变量)
+// ============================================================
+// key 必须和后端 meta.json 的 scalar_variables / config.js 的 variables 一致。
+// 这是个"全集", VariablePopover 会根据当前 source 从里面挑出需要的。
+const VARIABLE_META = {
+  // --- ROMS 海洋变量 ---
+  temp: {
     icon: Thermometer,
     label: "Temperature",
     unit: "°C",
     description: "Sea surface temperature",
   },
-  {
-    key: "salt",
+  salt: {
     icon: Droplet,
     label: "Salinity",
     unit: "PSU",
     description: "Sea surface salinity",
   },
-  {
-    key: "zeta",
+  zeta: {
     icon: Waves,
     label: "Sea level",
     unit: "m",
     description: "Sea surface height anomaly",
   },
-];
+  // --- WRF 大气变量 ---
+  // 注意: WRF 的 temp 也用上面那个 "temp" 条目 (气温, label 会显示
+  //       "Temperature" / "Sea surface temperature" —— 见下方 WRF 覆盖).
+  Pair: {
+    icon: Gauge,
+    label: "Pressure",
+    unit: "mbar",
+    description: "Sea level pressure",
+  },
+  Qair: {
+    icon: Droplet,
+    label: "Humidity",
+    unit: "%",
+    description: "Relative humidity",
+  },
+  rain: {
+    icon: CloudRain,
+    label: "Rainfall",
+    unit: "kg/m²/s",
+    description: "Rainfall rate",
+  },
+  cloud: {
+    icon: Cloud,
+    label: "Cloud cover",
+    unit: "",
+    description: "Cloud fraction (0-1)",
+  },
+};
+
+
+// WRF 大气源里 "temp" 其实是 2m 气温, 不是海温。
+// 当 source 是大气源时, 用这个覆盖 temp 的文案。
+const WRF_TEMP_META = {
+  icon: Thermometer,
+  label: "Air temperature",
+  unit: "°C",
+  description: "2 m air temperature",
+};
+
+
+// 根据 source 取该源的变量选项列表 (含元信息)
+function getVariableOptions(source) {
+  const varKeys = getSourceVariables(source);
+  const isAtmosphere = source && source.startsWith("wrf");
+  
+  return varKeys.map((key) => {
+    let meta = VARIABLE_META[key];
+    // 大气源的 temp 用气温文案
+    if (isAtmosphere && key === "temp") {
+      meta = WRF_TEMP_META;
+    }
+    // 兜底: 万一遇到没登记的变量, 给个默认
+    if (!meta) {
+      meta = {
+        icon: Waves,
+        label: key,
+        unit: "",
+        description: key,
+      };
+    }
+    return { key, ...meta };
+  });
+}
 
 
 export default function VariablePopover({
+  source,           // ⭐ 新增: 当前数据源, 决定显示哪些变量
   variable,
   setVariable,
-  ranges,           // {temp:{p01,p99},salt:{...},zeta:{...}}
-  currentValue,     // 可选: 当前小时全图的均值/中位数, 这里不强求
+  ranges,           // {temp:{p01,p99}, ...} - 动态, 跟着 source 变
 }) {
+  const options = getVariableOptions(source);
+  
   return (
     <PopoverFrame title="VARIABLE">
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-        {VARIABLE_OPTIONS.map((opt) => {
+        {options.map((opt) => {
           const isActive = variable === opt.key;
           const range = ranges?.[opt.key];
           const Icon = opt.icon;

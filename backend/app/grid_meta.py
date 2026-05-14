@@ -1,5 +1,36 @@
 """
 grid_meta.py
+============
+
+ROMS 网格元数据加载与缓存。
+
+为什么独立成一个模块:
+--------------------
+- 网格几何信息(经纬度、海陆掩膜、水深、度量因子)不随时间变化
+- 没必要每次取数据时都重复下载
+- 第一次跑时从 OPeNDAP 拉一次,存到本地,以后所有调用都用本地缓存
+- 这样把"慢的网络操作"和"快的本地计算"清晰分开
+
+提供的能力:
+----------
+- get_grid_meta(source_name): 返回某数据源的网格元数据(自动缓存)
+- 内置 mask_rho / h / lon_rho / lat_rho / lon_vert / lat_vert / pm / pn / angle
+- 预计算好的"cell polygons"列表,前端 DeckGL 直接用
+- 推荐的地图初始视图(中心点 + zoom)
+
+使用示例:
+---------
+    from grid_meta import get_grid_meta
+    
+    meta = get_grid_meta("perth")
+    print(meta.mask_rho.shape)         # (259, 129)
+    
+    meta_cwa = get_grid_meta("cwa")
+    print(meta_cwa.mask_rho.shape)     # (640, 480)
+
+依赖:
+-----
+    pip install xarray netCDF4 numpy
 """
 
 from __future__ import annotations
@@ -26,23 +57,47 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-
+# ============================================================
+# 配置: 数据源对应的 grid 文件
+# ============================================================
 GRID_SOURCES = {
     "perth": {
+        "kind": "roms",
         "url": "http://boreas.mywire.org:8080/thredds/dodsC/perthhis/perth_his_grid.nc",
         "expected_shape": (259, 129),
     },
     "cwa": {
+        "kind": "roms",
         # ⚠️ URL 命名 misleading:
         # cwa_qck_2026.ncml 这个 "ncml" 实际是 grid 文件(无 ocean_time, 只有静态网格)
         # 真正的数据聚合在 cwa_qck_202601.ncml (见 data_loader.py 配置)
         "url": "http://boreas.mywire.org:8080/thredds/dodsC/cwaqck/cwa_qck_2026.ncml",
         "expected_shape": (640, 480),
     },
+    # WRF 大气模型: d01 (WA 范围) + d02 (Perth 范围), 两个独立网格源.
+    # WRF 数据集没有独立 grid 文件, 从某天的 .nc 文件提取静态 grid 字段
+    # (LON/LAT/LANDMASK 是静态的, 哪一天的文件都一样, 用 2026-05-21 肯定有数据).
+    "wrf_d01": {
+        "kind": "wrf",
+        "url": "http://boreas.mywire.org:8080/thredds/dodsC/WRF2026/wrf_roms_d01_20260521.nc",
+        "expected_shape": (165, 99),
+        # ⭐ WRF 是大气模型: 全域有效, 不只是海洋.
+        #    all_cells_as_ocean=True 让陆地格子也建多边形,
+        #    这样气温/风在陆地上也能可视化 (windy 风格).
+        "all_cells_as_ocean": True,
+    },
+    "wrf_d02": {
+        "kind": "wrf",
+        "url": "http://boreas.mywire.org:8080/thredds/dodsC/WRF2026/wrf_roms_d02_20260521.nc",
+        "expected_shape": (165, 90),
+        "all_cells_as_ocean": True,
+    },
 }
 
 
-
+# ============================================================
+# 缓存路径
+# ============================================================
 def _get_cache_dir() -> Path:
     cache = os.environ.get("ROMS_GRID_CACHE_DIR")
     if cache:
@@ -50,7 +105,9 @@ def _get_cache_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "grid"
 
 
-
+# ============================================================
+# 网格元数据结构
+# ============================================================
 @dataclass
 class GridMeta:
     """
@@ -97,21 +154,38 @@ def _estimate_zoom(minLon: float, maxLon: float,
 
 
 # ============================================================
-# 核心: 从 NetCDF 文件加载网格元数据
+# 核心: 从 NetCDF 文件加载网格元数据 (分派 ROMS / WRF)
 # ============================================================
-def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
+def _load_grid_from_nc(nc_path: str | Path, source_name: str,
+                       kind: str = "roms",
+                       all_cells_as_ocean: bool = False) -> GridMeta:
     """
     从一个 NetCDF 文件加载网格元数据。
-    可以是本地路径,也可以是 OPeNDAP URL。
     
+    kind="roms":  Perth/CWA, 用 lon_rho/lat_rho/lon_vert/lat_vert/mask_rho 等
+    kind="wrf":   WRF, 用 LON/LAT/LANDMASK, 角点从中心点推
+    
+    all_cells_as_ocean=True 时, 把 mask 全设为 1, oceanCells 包含所有格子.
+    (用于大气数据可视化, 陆地也画.)
+    """
+    if kind == "roms":
+        return _load_grid_roms(nc_path, source_name, all_cells_as_ocean)
+    elif kind == "wrf":
+        return _load_grid_wrf(nc_path, source_name, all_cells_as_ocean)
+    else:
+        raise ValueError(f"Unknown grid kind: {kind!r}")
+
+
+def _load_grid_roms(nc_path, source_name, all_cells_as_ocean=False) -> GridMeta:
+    """
+    从 ROMS grid 文件加载.
     必需变量: lon_rho, lat_rho, lon_vert, lat_vert, mask_rho, h
     可选变量: pm, pn, angle (Perth 有, CWA 没有)
     """
-    logger.info(f"Loading grid metadata from: {nc_path}")
+    logger.info(f"Loading ROMS grid from: {nc_path}")
     t0 = time.time()
     
     with xr.open_dataset(str(nc_path)) as ds:
-        # 必需变量 (没有会报错)
         lon_rho = ds["lon_rho"].values.astype(np.float64)
         lat_rho = ds["lat_rho"].values.astype(np.float64)
         lon_vert = ds["lon_vert"].values.astype(np.float64)
@@ -119,9 +193,6 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
         mask_rho = ds["mask_rho"].values.astype(np.float32)
         h = ds["h"].values.astype(np.float32)
         
-        # 可选变量 (Perth 有, CWA 没有)
-        # 不存在时用占位符: pm/pn 用 1.0 (假装是 1m 网格, 仅 Test 4 报告会显示奇怪),
-        # angle 用 0 (假装网格不旋转, 对 surface u/v 不影响)
         if "pm" in ds.variables:
             pm = ds["pm"].values.astype(np.float32)
         else:
@@ -137,12 +208,126 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
         if "angle" in ds.variables:
             angle = ds["angle"].values.astype(np.float32)
         else:
-            logger.info(f"  Note: 'angle' not in grid file, using zeros (no rotation)")
+            logger.info(f"  Note: 'angle' not in grid file, using zeros")
             angle = np.zeros_like(mask_rho)
     
     elapsed = time.time() - t0
     logger.info(f"  Loaded in {elapsed:.1f}s. Grid shape: {mask_rho.shape}")
     
+    # 如果要"全画" (大气数据可视化), 把 mask 全置 1
+    if all_cells_as_ocean:
+        logger.info(f"  all_cells_as_ocean=True: treating all cells as visible")
+        mask_for_cells = np.ones_like(mask_rho)
+    else:
+        mask_for_cells = mask_rho
+    
+    return _finalize_grid_meta(
+        source_name, lon_rho, lat_rho, lon_vert, lat_vert,
+        mask_rho, mask_for_cells, h, pm, pn, angle,
+    )
+
+
+def _load_grid_wrf(nc_path, source_name, all_cells_as_ocean=False) -> GridMeta:
+    """
+    从 WRF 输出文件加载 grid.
+    
+    WRF 有:
+      LON (dim1, dim2)        - 经度 2D
+      LAT (dim1, dim2)        - 纬度 2D
+      LANDMASK (dim1, dim2)   - 1=陆地, 0=水 (注意和 ROMS 反的)
+    
+    WRF 没有:
+      vert (角点)             - 我们从 cell 中心推算
+      h (深度)                - 大气不需要, 全置 0
+      pm/pn (度量因子)         - 不需要, 占位
+      angle (网格旋转角)        - 不需要, 占位 0
+    """
+    logger.info(f"Loading WRF grid from: {nc_path}")
+    t0 = time.time()
+    
+    with xr.open_dataset(str(nc_path)) as ds:
+        lon_rho = ds["LON"].values.astype(np.float64)
+        lat_rho = ds["LAT"].values.astype(np.float64)
+        landmask = ds["LANDMASK"].values.astype(np.float32)
+    
+    # ⭐ WRF LANDMASK: 1=陆地, 0=水
+    # 转成 ROMS 约定的 mask_rho: 1=海洋, 0=陆地
+    mask_rho = 1.0 - landmask
+    
+    n_eta, n_xi = lon_rho.shape
+    
+    # 从 cell 中心推算角点 (lon_vert, lat_vert)
+    # 这是个标准的"网格细化"操作: 取相邻 4 个 cell 中心的平均作为它们共享的角点
+    logger.info(f"  Computing cell corners from centers...")
+    lon_vert = _infer_vertices(lon_rho)
+    lat_vert = _infer_vertices(lat_rho)
+    
+    # 占位字段
+    h = np.zeros_like(mask_rho)  # 大气没有"水深", 全 0
+    pm = np.ones_like(mask_rho)
+    pn = np.ones_like(mask_rho)
+    angle = np.zeros_like(mask_rho)
+    
+    elapsed = time.time() - t0
+    logger.info(f"  Loaded in {elapsed:.1f}s. Grid shape: {mask_rho.shape}")
+    
+    # ⭐ WRF 默认 all_cells_as_ocean=True: 大气数据全域有效
+    if all_cells_as_ocean:
+        logger.info(f"  all_cells_as_ocean=True: rendering all cells (incl. land)")
+        mask_for_cells = np.ones_like(mask_rho)
+    else:
+        mask_for_cells = mask_rho
+    
+    return _finalize_grid_meta(
+        source_name, lon_rho, lat_rho, lon_vert, lat_vert,
+        mask_rho, mask_for_cells, h, pm, pn, angle,
+    )
+
+
+def _infer_vertices(centers: np.ndarray) -> np.ndarray:
+    """
+    从 cell 中心数组 (n_eta, n_xi) 推算角点数组 (n_eta+1, n_xi+1).
+    
+    每个内部角点 = 周围 4 个中心的平均.
+    边缘角点 = 用外推 (中心 + 偏移).
+    
+    这是 WRF 没提供角点时的标准 fallback.
+    """
+    n_eta, n_xi = centers.shape
+    vert = np.zeros((n_eta + 1, n_xi + 1), dtype=np.float64)
+    
+    # 内部角点: 4 个中心的平均
+    vert[1:-1, 1:-1] = 0.25 * (
+        centers[:-1, :-1] + centers[:-1, 1:] +
+        centers[1:, :-1]  + centers[1:, 1:]
+    )
+    
+    # 4 条边 (用外推)
+    # 上边: extrapolate from row 0
+    vert[0, 1:-1] = 2 * centers[0, :-1] - vert[1, 1:-1] + (centers[0, 1:] - centers[0, :-1]) * 0.5
+    vert[0, 1:-1] = 0.5 * (centers[0, :-1] + centers[0, 1:])  # 简化: 两端中心的中点
+    # 下边
+    vert[-1, 1:-1] = 0.5 * (centers[-1, :-1] + centers[-1, 1:])
+    # 左边
+    vert[1:-1, 0] = 0.5 * (centers[:-1, 0] + centers[1:, 0])
+    # 右边
+    vert[1:-1, -1] = 0.5 * (centers[:-1, -1] + centers[1:, -1])
+    
+    # 4 个角
+    # 用最近的中心向外延伸半个 cell
+    dlon_corner = (centers[0, 1] - centers[0, 0]) * 0.5
+    dlat_corner = (centers[1, 0] - centers[0, 0]) * 0.5
+    vert[0, 0]   = centers[0, 0]   - dlon_corner - dlat_corner
+    vert[0, -1]  = centers[0, -1]  + dlon_corner - dlat_corner
+    vert[-1, 0]  = centers[-1, 0]  - dlon_corner + dlat_corner
+    vert[-1, -1] = centers[-1, -1] + dlon_corner + dlat_corner
+    
+    return vert
+
+
+def _finalize_grid_meta(source_name, lon_rho, lat_rho, lon_vert, lat_vert,
+                        mask_rho, mask_for_cells, h, pm, pn, angle) -> GridMeta:
+    """ROMS 和 WRF 路径的公共最后阶段: 算 bounds, suggested_view, ocean_cells."""
     n_eta, n_xi = mask_rho.shape
     
     valid = np.isfinite(lon_rho) & np.isfinite(lat_rho)
@@ -162,16 +347,17 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
         "zoom": zoom,
     }
     
-    logger.info(f"  Pre-computing ocean cell polygons...")
+    logger.info(f"  Pre-computing cell polygons...")
     t1 = time.time()
     ocean_cells = _build_ocean_cells(
-        lon_vert, lat_vert, mask_rho, h
+        lon_vert, lat_vert, mask_for_cells, h
     )
     cell_elapsed = time.time() - t1
+    label = "all" if np.all(mask_for_cells > 0.5) else "ocean"
     logger.info(
-        f"  Built {len(ocean_cells)} ocean cells in {cell_elapsed:.1f}s "
-        f"(out of {n_eta * n_xi} total cells, "
-        f"{100 * len(ocean_cells) / (n_eta * n_xi):.1f}% ocean)"
+        f"  Built {len(ocean_cells)} {label} cells in {cell_elapsed:.1f}s "
+        f"(out of {n_eta * n_xi} total, "
+        f"{100 * len(ocean_cells) / (n_eta * n_xi):.1f}%)"
     )
     
     return GridMeta(
@@ -180,7 +366,7 @@ def _load_grid_from_nc(nc_path: str | Path, source_name: str) -> GridMeta:
         lat_rho=lat_rho.astype(np.float32),
         lon_vert=lon_vert.astype(np.float32),
         lat_vert=lat_vert.astype(np.float32),
-        mask_rho=mask_rho,
+        mask_rho=mask_rho,  # 保留真实 mask (mask_for_cells 是渲染用的)
         h=h,
         pm=pm,
         pn=pn,
@@ -277,15 +463,28 @@ def get_grid_meta(
     
     local_nc = cache_dir / f"{source_name}_grid.nc"
     
+    # 从配置读类型
+    kind = config.get("kind", "roms")
+    all_cells_as_ocean = config.get("all_cells_as_ocean", False)
+    
     if local_nc.exists() and not force_refresh:
         logger.info(f"Using cached grid file: {local_nc}")
-        meta = _load_grid_from_nc(local_nc, source_name)
+        meta = _load_grid_from_nc(local_nc, source_name, kind, all_cells_as_ocean)
         _verify_grid(meta, config)
         return meta
     
     urls_to_try = [config["url"]]
     if "url_fallback" in config:
         urls_to_try.append(config["url_fallback"])
+    
+    # 根据 kind 选要下载的变量
+    if kind == "wrf":
+        # WRF: 只需 LON/LAT/LANDMASK (角点和占位字段在加载时算)
+        needed = ["LON", "LAT", "LANDMASK"]
+    else:
+        # ROMS: 完整 grid 字段
+        needed = ["lon_rho", "lat_rho", "lon_vert", "lat_vert",
+                  "mask_rho", "h", "pm", "pn", "angle"]
     
     download_error = None
     downloaded = False
@@ -295,8 +494,6 @@ def get_grid_meta(
             t0 = time.time()
             
             with xr.open_dataset(url) as remote_ds:
-                needed = ["lon_rho", "lat_rho", "lon_vert", "lat_vert",
-                          "mask_rho", "h", "pm", "pn", "angle"]
                 available = [v for v in needed if v in remote_ds.variables]
                 missing = set(needed) - set(available)
                 if missing:
@@ -322,7 +519,7 @@ def get_grid_meta(
             f"Failed to download grid from all URLs. Last error: {download_error}"
         )
     
-    meta = _load_grid_from_nc(local_nc, source_name)
+    meta = _load_grid_from_nc(local_nc, source_name, kind, all_cells_as_ocean)
     _verify_grid(meta, config)
     return meta
 

@@ -8,12 +8,22 @@
 import React, { useState } from "react";
 import { X } from "lucide-react";
 import { theme } from "../theme.js";
+import { formatValue } from "../render/colormaps.js";
 
 
+// 采样卡片标题. ROMS 海洋变量 + WRF 大气变量都覆盖.
 const TITLES = {
+  // --- ROMS 海洋 ---
   temp: "SURFACE TEMP",
   salt: "SURFACE SALINITY",
   zeta: "SEA LEVEL",
+  // --- WRF 大气 ---
+  // 注: 大气源的 temp 是气温. key 共用 "temp", 但海洋源/大气源
+  //     不会同时出现, 所以这里给一个通用的写法 —— 见下方 resolveTitle.
+  Pair: "PRESSURE",
+  Qair: "HUMIDITY",
+  rain: "RAINFALL",
+  cloud: "CLOUD COVER",
 };
 
 
@@ -95,7 +105,9 @@ export default function PointPopup({
             lineHeight: 1.1,
             fontVariantNumeric: "tabular-nums",
           }}>
-            {point.value.toFixed(2)} <span style={{
+            {/* ⭐ 用 formatValue 智能格式化, 而不是写死 toFixed(2).
+                否则 rainfall (0.00x 量级) 会显示成 "0.00". */}
+            {formatValue(point.value)} <span style={{
               fontSize: theme.fsBody,
               color: theme.textMuted,
               fontWeight: theme.fwNormal,

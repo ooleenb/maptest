@@ -7,12 +7,23 @@
 
 import React from "react";
 import { theme } from "../theme.js";
+import { formatValue } from "../render/colormaps.js";
 
 
+// 变量显示标题. ROMS 海洋变量 + WRF 大气变量都覆盖.
+// 找不到的变量回退到大写形式.
 const VAR_TITLES = {
+  // --- ROMS 海洋 ---
   temp: "Temperature",
   salt: "Salinity",
   zeta: "Sea level",
+  // --- WRF 大气 ---
+  // 注: temp 在大气源里其实是气温, 但 key 共用 "temp", 这里统一显示
+  //     "Temperature" 也说得通 (气温也是温度). 单位 °C 一致.
+  Pair: "Pressure",
+  Qair: "Humidity",
+  rain: "Rainfall",
+  cloud: "Cloud cover",
 };
 
 
@@ -80,11 +91,13 @@ export default function ColorbarLegend({
         color: theme.textMuted,
         fontVariantNumeric: "tabular-nums",
       }}>
-        <span>{min.toFixed(1)}</span>
-        <span>{q1.toFixed(1)}</span>
-        <span>{mid.toFixed(1)}</span>
-        <span>{q3.toFixed(1)}</span>
-        <span>{max.toFixed(1)}</span>
+        {/* ⭐ 用 formatValue 智能格式化, 而不是写死 toFixed(1).
+            否则 rainfall (0.0x ~ 0.000x 量级) 会全部显示成 "0.0". */}
+        <span>{formatValue(min)}</span>
+        <span>{formatValue(q1)}</span>
+        <span>{formatValue(mid)}</span>
+        <span>{formatValue(q3)}</span>
+        <span>{formatValue(max)}</span>
       </div>
     </div>
   );

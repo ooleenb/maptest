@@ -5,7 +5,7 @@ import { LineLayer, ScatterplotLayer } from "@deck.gl/layers";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 import { loadGrid, listAvailableDates } from "./data/loader.js";
-import { DEFAULT_SOURCE, FALLBACK_DATE } from "./data/config.js";
+import { DEFAULT_SOURCE, FALLBACK_DATE, getDefaultVariable, getSourceVariables } from "./data/config.js";
 import { COLORMAPS, DEFAULT_COLORMAP, VARIABLE_UNITS } from "./render/colormaps.js";
 import {
   buildColoredCells, createScalarLayer, sampleAtPoint,
@@ -34,6 +34,20 @@ import { theme } from "./theme.js";
 
 const SLOW_LOAD_THRESHOLD_MS = 2000;
 const MAX_HOUR = 23;
+
+
+// ⭐ 推断数据源类型 ("ocean" | "atmosphere").
+//    判断顺序很重要:
+//    1. 先看 source 名字 —— 前端自己的状态, 100% 可靠.
+//       所有 WRF 源都以 "wrf" 开头.
+//    2. 再看 day.sourceKind —— 来自后端 meta.json, 但旧数据可能缺这个
+//       字段, loader.js 会兜底成 "ocean", 所以不能优先信它.
+//    3. 都没有 -> 默认 ocean.
+function resolveSourceKind(source, day) {
+  if (source && source.startsWith("wrf")) return "atmosphere";
+  if (day?.sourceKind) return day.sourceKind;
+  return "ocean";
+}
 
 
 // CARTO Voyager: 比 OSM 更克制的彩色底图
@@ -141,6 +155,17 @@ export default function App() {
 
     setParticleCount(newSource === "cwa" ? 800 : 1400);
     
+    // ⭐ 切源时检查当前 variable 在新源里是否存在.
+    //    ROMS 有 temp/salt/zeta, WRF 有 temp/Pair/Qair/rain/cloud.
+    //    如果当前选的变量新源没有 (例如从 Perth 的 salt 切到 WRF),
+    //    就重置到新源的第一个变量 (通常是 temp).
+    const newSourceVars = getSourceVariables(newSource);
+    if (!newSourceVars.includes(variable)) {
+      const fallbackVar = getDefaultVariable(newSource);
+      console.log(`[App] Variable '${variable}' not in ${newSource}, reset to '${fallbackVar}'`);
+      setVariable(fallbackVar);
+    }
+    
     // 切日期到 fallback (datesIndex 加载完会自动跳到最新一天)
     setDate(FALLBACK_DATE);
     autoPickedRef.current = false;
@@ -242,7 +267,13 @@ export default function App() {
   const coloredCells = useMemo(() => {
     if (!grid || !day) return null;
     
+    // ⭐ 防御: 切源瞬间 source 已变但 day 还是旧数据,
+    //    此时 day.scalars[variable] 可能 undefined (例如旧 day 是 ROMS,
+    //    variable 已重置成 WRF 的某个变量). 等新 day 加载完会重新进来.
     const scalar = day.scalars[variable];
+    if (!scalar) {
+      return null;
+    }
     const dayShape = scalar.shape;
     if (dayShape[1] !== grid.nEta || dayShape[2] !== grid.nXi) {
       console.log(`[App] grid/day shape mismatch: skipping render`);
@@ -254,8 +285,22 @@ export default function App() {
     let colorMin, colorMax;
     if (rangeMode === "global") {
       const range = day.ranges[variable];
-      colorMin = range.p01;
-      colorMax = range.p99;
+      // 防御: range 也可能在切换瞬间缺失
+      if (!range) {
+        return null;
+      }
+      // ⭐ rain (降雨) 特殊处理:
+      //   降雨是"稀疏"数据 —— 绝大部分格子是 0, 只有零星格子有值.
+      //   用 p01~p99 的话, p99 ≈ 0 (因为 99% 是 0), 有雨的格子会全部
+      //   被 clip 到色带最右端, 色场失去层次.
+      //   改用 0 ~ global_max, 让有雨格子能正常映射到色带.
+      if (variable === "rain") {
+        colorMin = 0;
+        colorMax = range.max > 0 ? range.max : 1;  // 防止全 0 那天 max=0 除零
+      } else {
+        colorMin = range.p01;
+        colorMax = range.p99;
+      }
     } else {
       const mm = computeFrameMinMax(frameData);
       colorMin = mm.min;
@@ -292,6 +337,7 @@ export default function App() {
         oceanCells: grid.oceanCells,
         nParticles: particleCount,
         trailLength: trailLengthForSource,
+        kind: resolveSourceKind(source, day),  // ⭐ 海洋/大气 决定粒子行为
       });
     } else {
       simulatorRef.current.reset(uvFrame, grid.bounds, grid.oceanCells);
@@ -481,6 +527,7 @@ export default function App() {
       
       {day && activeSidebar === "variable" && (
         <VariablePopover
+          source={source}
           variable={variable}
           setVariable={setVariable}
           ranges={day.ranges}
@@ -538,7 +585,10 @@ export default function App() {
       )}
       
       {particlesEnabled && coloredCells && (
-        <ParticleLegend bottomOffset={110} />
+        <ParticleLegend
+          bottomOffset={110}
+          kind={resolveSourceKind(source, day)}
+        />
       )}
       
       {pickedPoint && popupScreenPos && day && (

@@ -221,10 +221,22 @@ export const COLORMAPS = {
 // ============================================================
 // 每个变量的默认 colormap
 // ============================================================
+// ROMS 海洋变量:   temp / salt / zeta
+// WRF 大气变量:    temp(气温, 复用 windyTemp) / Pair / Qair / rain / cloud
+//
+// 注: WRF 的 temp 和 ROMS 的 temp 共用 key "temp", 所以都用 windyTemp ——
+//     气温和海温都是温度, windyTemp 配色对两者都合适。
+//     Pair/Qair/rain/cloud 给了能用的默认值, 用户可在 colormap 选择器里随意更换。
 export const DEFAULT_COLORMAP = {
-  temp: "windyTemp",   // ⭐ 改为 Windy 风格
+  // --- ROMS / 通用 ---
+  temp: "windyTemp",   // ⭐ Windy 风格 (海温 + 气温通用)
   salt: "haline",
   zeta: "balance",
+  // --- WRF 大气专属 ---
+  Pair:  "RdBu_r",     // 海平面气压 - 蓝白红双极性
+  Qair:  "viridis",    // 相对湿度 - 通用感知均匀
+  rain:  "viridis",    // 降雨率 - 通用
+  cloud: "viridis",    // 云量 - 通用
 };
 
 
@@ -232,9 +244,15 @@ export const DEFAULT_COLORMAP = {
 // 变量的单位
 // ============================================================
 export const VARIABLE_UNITS = {
+  // --- ROMS / 通用 ---
   temp: "°C",
-  salt: "",     // 盐度通常无量纲 (PSU)
+  salt: "",      // 盐度通常无量纲 (PSU)
   zeta: "m",
+  // --- WRF 大气专属 ---
+  Pair:  "mbar", // 海平面气压
+  Qair:  "%",    // 相对湿度
+  rain:  "kg/m²/s", // 降雨率
+  cloud: "",     // 云量 (0-1 无量纲)
 };
 
 
@@ -246,4 +264,32 @@ export function valueToRGBA(value, min, max, cmap, alpha = 200) {
   const t = (value - min) / (max - min || 1);
   const [r, g, b] = cmap(t);
   return [r, g, b, alpha];
+}
+
+// ============================================================
+// 智能数值格式化
+// ============================================================
+// 问题: 固定小数位 (toFixed(1)/toFixed(2)) 对不同量级的变量都不合适.
+//   - 气压 1013    -> toFixed(1) = "1013.0"  (多余的 .0)
+//   - 气温 25.3    -> toFixed(1) = "25.3"    (刚好)
+//   - 降雨 0.001   -> toFixed(1) = "0.0"     (❌ 信息全丢了!)
+//   - 降雨 0.00002 -> toFixed(2) = "0.00"    (❌ 同样全丢)
+//
+// 解法: 根据数值的绝对大小, 动态选择合适的小数位数, 保证总能看到
+//   有意义的有效数字. 降雨这种 0.0x ~ 0.000x 量级的值也能正常显示.
+//
+// 用于: ColorbarLegend 的刻度数字、PointPopup 的采样值.
+export function formatValue(v) {
+  if (v == null || !Number.isFinite(v)) return "—";
+  
+  const abs = Math.abs(v);
+  
+  if (abs === 0) return "0";
+  if (abs >= 100)    return v.toFixed(0);   // 1013
+  if (abs >= 10)     return v.toFixed(1);   // 25.3
+  if (abs >= 1)      return v.toFixed(2);   // 3.60
+  if (abs >= 0.01)   return v.toFixed(3);   // 0.021  <- rain 的有雨格子
+  if (abs >= 0.0001) return v.toFixed(5);   // 0.00101 <- rain 的 p99
+  // 极小值 (例如 1e-6 级别): 用科学计数法, 否则要一长串 0
+  return v.toExponential(1);                // 1.2e-7
 }

@@ -1,5 +1,34 @@
 """
 prep_day.py
+===========
+
+核心预处理脚本: 给定一个日期,生成前端需要的完整数据包。
+
+输出目录结构:
+    backend/data/frames/<source>/<date>/
+        meta.json           ← 帧时间戳、变量统计、版本信息
+        temp.bin            ← 24 帧温度场 (Float32 二进制)
+        salt.bin            ← 24 帧盐度场
+        zeta.bin            ← 24 帧海面高度
+        uv_00.png ~ uv_23.png  ← 24 帧 u/v 编码图
+
+数据格式设计:
+- 标量场 (temp/salt/zeta) → 裸 Float32 二进制
+  * 浏览器原生支持 (一行 fetch + arrayBuffer + new Float32Array)
+  * 24 帧打包成 1 个文件,减少网络请求
+  * 陆地点存 NaN (前端绘图时跳过)
+- u/v 流场 → PNG (R=u, G=v, B=mask)
+  * GPU 友好: 浏览器解码到纹理是硬件加速
+  * 归一化范围在 meta.json 里,前端解码时还原
+- meta.json: 所有元信息
+
+依赖:
+    pip install xarray netCDF4 dask numpy pillow
+
+用法:
+    python prep_day.py 2026-03-11
+    python prep_day.py 2026-03-11 --source perth
+    python prep_day.py 2026-03-11 --output-dir /path/to/output
 """
 
 from __future__ import annotations
@@ -17,7 +46,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
-
+# 导入我们前两步写好的模块
 from data_loader import ROMSDataSource, FrameData
 from grid_meta import get_grid_meta, GridMeta
 
@@ -32,27 +61,81 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-
+# ============================================================
+# 输出格式版本
+# ============================================================
+# 当数据格式发生破坏性变化时,bump 这个版本号。
+# 前端可以读 meta.json 的 format_version 检查兼容性。
 FORMAT_VERSION = "1.0"
 
 
+# ============================================================
+# u/v PNG 编码范围 (per-source)
+# ============================================================
+# 把 u/v 归一化到 0-255 的 byte 值, 范围要覆盖实际数据的 99% 以上 + headroom.
+#
+# ⚠️ 关键: ROMS 和 WRF 的 u/v 物理量完全不同!
+#   - ROMS: 海流速度, 典型 ±1 m/s, 极端 ±2 m/s  -> 用 2.5
+#   - WRF:  10m 风速,  典型 ±10 m/s, 极端 ±20 m/s -> 用 30.0
+# 如果 WRF 用 2.5, 风速会被严重 clip, 粒子动画全乱.
+#
+# _get_uv_range(source_name) 按数据源返回对应范围.
+UV_NORM_RANGE_DEFAULT = 2.5   # 兜底值 (ROMS 风格)
 
-UV_NORM_RANGE = 2.5  # u/v 的归一化半范围(单位 m/s)
+UV_NORM_RANGE_BY_SOURCE = {
+    "perth":   2.5,    # ROMS 海流
+    "cwa":     2.5,    # ROMS 海流
+    "wrf_d01": 30.0,   # WRF 风速 (10m wind, 可达 ±20+ m/s)
+    "wrf_d02": 30.0,   # WRF 风速
+}
 
 
+def _get_uv_range(source_name: str) -> float:
+    """按数据源返回 u/v PNG 编码的归一化半范围 (m/s)."""
+    return UV_NORM_RANGE_BY_SOURCE.get(source_name, UV_NORM_RANGE_DEFAULT)
 
+
+# 向后兼容: 旧代码引用的 UV_NORM_RANGE 仍然存在 (= 默认值)
+UV_NORM_RANGE = UV_NORM_RANGE_DEFAULT
+
+
+# ============================================================
+# 默认输出目录
+# ============================================================
 def _default_output_dir() -> Path:
     """默认输出到 backend/data/frames/"""
     return Path(__file__).resolve().parent.parent / "data" / "frames"
 
 
-
+# ============================================================
+# 标量场打包
+# ============================================================
 def _pack_scalar_field(
     frames: list[FrameData],
     var_name: str,
     output_path: Path,
 ) -> dict:
-   
+    """
+    把 24 帧的某个标量场 (temp/salt/zeta) 打包成单个 Float32 二进制文件。
+    
+    数据布局:
+        frame_0_row_0_col_0, frame_0_row_0_col_1, ..., frame_0_row_258_col_128,
+        frame_1_row_0_col_0, ...,
+        ...
+        frame_23_...
+    
+    陆地/无效点保持 NaN (前端绘图时跳过)。
+    
+    参数:
+    -----
+    frames: FrameData 列表
+    var_name: 'temp' / 'salt' / 'zeta'
+    output_path: 输出文件路径
+    
+    返回:
+    -----
+    包含此变量元信息的字典(用于 meta.json)
+    """
     # 用 getattr 动态访问 frame.temp / frame.salt / frame.zeta
     arrays = [getattr(f, var_name) for f in frames]
     
@@ -161,16 +244,21 @@ def _pack_uv_frames(
     frames: list[FrameData],
     mask_rho: np.ndarray,
     output_dir: Path,
+    uv_range: float = UV_NORM_RANGE_DEFAULT,
 ) -> dict:
     """
-    把 24 帧 u/v 全部编码成 PNG,返回元信息。
+    把全部帧的 u/v 编码成 PNG,返回元信息。
+    
+    uv_range: u/v 归一化半范围 (m/s). ROMS 用 2.5, WRF 用 30.0.
+              由 prepare_day 通过 _get_uv_range(source) 传入.
     """
     files = []
     total_bytes = 0
     
     for i, frame in enumerate(frames):
         output_path = output_dir / f"uv_{i:02d}.png"
-        _encode_uv_to_png(frame.u, frame.v, mask_rho, output_path)
+        _encode_uv_to_png(frame.u, frame.v, mask_rho, output_path,
+                          uv_range=uv_range)
         files.append(output_path.name)
         total_bytes += output_path.stat().st_size
     
@@ -183,25 +271,26 @@ def _pack_uv_frames(
     actual_u_range = (float(np.min(u_valid)), float(np.max(u_valid)))
     actual_v_range = (float(np.min(v_valid)), float(np.max(v_valid)))
     
-    # 检查是否被归一化截断
+    # 检查是否被归一化截断 (用传入的 uv_range, 不是全局常量)
     truncated = (
-        actual_u_range[0] < -UV_NORM_RANGE or
-        actual_u_range[1] > UV_NORM_RANGE or
-        actual_v_range[0] < -UV_NORM_RANGE or
-        actual_v_range[1] > UV_NORM_RANGE
+        actual_u_range[0] < -uv_range or
+        actual_u_range[1] > uv_range or
+        actual_v_range[0] < -uv_range or
+        actual_v_range[1] > uv_range
     )
     if truncated:
         logger.warning(
-            f"  u/v values exceed PNG encoding range ±{UV_NORM_RANGE}! "
+            f"  u/v values exceed PNG encoding range +/-{uv_range}! "
             f"u: {actual_u_range}, v: {actual_v_range}. "
-            f"Increase UV_NORM_RANGE in prep_day.py."
+            f"Increase the range for this source in UV_NORM_RANGE_BY_SOURCE."
         )
     
+    n_frames = len(frames)
     info = {
         "files": files,
-        "n_frames": len(frames),
+        "n_frames": n_frames,
         "encoding": "RGBA8 (R=u, G=v, B=mask, A=unused)",
-        "norm_range": UV_NORM_RANGE,
+        "norm_range": uv_range,
         "decode_formula": {
             "u": "R / 255 * 2 * norm_range - norm_range",
             "v": "G / 255 * 2 * norm_range - norm_range",
@@ -214,9 +303,10 @@ def _pack_uv_frames(
     
     logger.info(
         f"  uv_*.png: {total_bytes / 1024:.0f} KB total "
-        f"({total_bytes / 24 / 1024:.1f} KB/frame), "
+        f"({total_bytes / max(n_frames,1) / 1024:.1f} KB/frame), "
         f"u={actual_u_range[0]:.2f}~{actual_u_range[1]:.2f}, "
-        f"v={actual_v_range[0]:.2f}~{actual_v_range[1]:.2f}"
+        f"v={actual_v_range[0]:.2f}~{actual_v_range[1]:.2f}, "
+        f"norm_range=+/-{uv_range}"
     )
     
     return info
@@ -297,32 +387,46 @@ def prepare_day(
         grid_meta = get_grid_meta(source_name)
         
         # 步骤 2: 从 OPeNDAP 拉一天数据
-        logger.info(f"\n[2/4] Fetching 24 frames from OPeNDAP...")
+        logger.info(f"\n[2/4] Fetching frames from OPeNDAP...")
         frames = data_source.get_day(date)
         
         if len(frames) == 0:
             raise RuntimeError(f"No data returned for {date}")
         
-        # 步骤 3: 打包标量场
-        logger.info(f"\n[3/4] Packing scalar fields...")
+        # 这一天实际包含哪些标量变量? 从第一帧动态读取.
+        #   ROMS:  ['temp', 'salt', 'zeta']
+        #   WRF:   ['temp', 'Pair', 'Qair', 'rain', 'cloud']
+        scalar_vars = frames[0].variables
+        logger.info(f"  Frames contain scalar variables: {scalar_vars}")
+        
+        # 数据源类型 (ocean / atmosphere) 和 u/v 编码范围
+        source_kind = data_source.config.get("kind", "ocean")
+        uv_range = _get_uv_range(source_name)
+        
+        # 步骤 3: 打包标量场 (动态遍历, 不再写死 temp/salt/zeta)
+        logger.info(f"\n[3/4] Packing {len(scalar_vars)} scalar fields...")
         var_info = {}
-        for var_name in ["temp", "salt", "zeta"]:
+        for var_name in scalar_vars:
             var_info[var_name] = _pack_scalar_field(
                 frames, var_name, output_dir / f"{var_name}.bin"
             )
         
-        # 步骤 4: 编码 u/v PNG
-        logger.info(f"\n[4/4] Encoding u/v to PNG...")
-        uv_info = _pack_uv_frames(frames, grid_meta.mask_rho, output_dir)
+        # 步骤 4: 编码 u/v PNG (uv_range 按数据源不同: ROMS 2.5, WRF 30)
+        logger.info(f"\n[4/4] Encoding u/v to PNG (norm_range=+/-{uv_range})...")
+        uv_info = _pack_uv_frames(
+            frames, grid_meta.mask_rho, output_dir, uv_range=uv_range
+        )
         
         # 写 meta.json
         times_iso = [f.time.isoformat() for f in frames]
         meta = {
             "format_version": FORMAT_VERSION,
             "source": source_name,
+            "source_kind": source_kind,          # 'ocean' | 'atmosphere'
             "date": date,
             "n_frames": len(frames),
             "grid_shape": [grid_meta.n_eta, grid_meta.n_xi],
+            "scalar_variables": scalar_vars,      # 这一天有哪些标量变量
             "times": times_iso,
             "variables": var_info,
             "uv": uv_info,

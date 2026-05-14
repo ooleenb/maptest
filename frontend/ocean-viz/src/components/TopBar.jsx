@@ -4,6 +4,8 @@
  * 
  * 顶部 44px 细横栏。
  * 包含: logo + 数据源切换按钮 + 日期选择 + 缓存计数。
+ * 
+ * logo 可点击 -> 从下方展开 AboutPopover (项目简介)。
  */
 
 import React, { useState, useRef, useEffect } from "react";
@@ -12,6 +14,7 @@ import { theme } from "../theme.js";
 import { getSourceInfo } from "../data/config.js";
 import DateSelectorPopover from "./popovers/DateSelectorPopover.jsx";
 import SourcePopover from "./popovers/SourcePopover.jsx";
+import AboutPopover from "./AboutPopover.jsx";
 
 
 export default function TopBar({
@@ -26,8 +29,11 @@ export default function TopBar({
 }) {
   const [dateOpen, setDateOpen] = useState(false);
   const [sourceOpen, setSourceOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);   // ⭐ 项目简介弹层
+  const [logoHover, setLogoHover] = useState(false);   // logo hover 态
   const dateBtnRef = useRef(null);
   const sourceBtnRef = useRef(null);
+  const aboutBtnRef = useRef(null);                    // ⭐ logo 按钮 ref
   
   // 点击外部关闭日期 popover
   useEffect(() => {
@@ -57,6 +63,30 @@ export default function TopBar({
     return () => document.removeEventListener("mousedown", handler);
   }, [sourceOpen]);
   
+  // ⭐ 点击外部关闭项目简介 popover (与 source/date 同样的模式)
+  useEffect(() => {
+    if (!aboutOpen) return;
+    const handler = (e) => {
+      if (aboutBtnRef.current && !aboutBtnRef.current.contains(e.target)) {
+        if (!e.target.closest("[data-popover='about']")) {
+          setAboutOpen(false);
+        }
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [aboutOpen]);
+  
+  // ⭐ 按 Esc 关闭项目简介 popover
+  useEffect(() => {
+    if (!aboutOpen) return;
+    const handler = (e) => {
+      if (e.key === "Escape") setAboutOpen(false);
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [aboutOpen]);
+  
   const isCached = (availableDates ?? []).includes(date);
   const cachedCount = (availableDates ?? []).length;
   const totalCount = (remoteDates ?? []).length;
@@ -74,25 +104,45 @@ export default function TopBar({
       fontFamily: theme.fontFamily,
       color: theme.text,
     }}>
-      {/* Logo */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 10,
-        flexShrink: 0,
-      }}>
-        <div style={{
-          width: 28, height: 28, borderRadius: "50%",
-          border: `1.5px solid ${theme.accent}`,
-          display: "flex", alignItems: "center", justifyContent: "center",
-        }}>
-          <Waves size={14} color={theme.accent} strokeWidth={2} />
-        </div>
-        <div style={{
-          fontSize: theme.fsSmall,
-          color: theme.textMuted,
-          fontWeight: theme.fwMedium,
-        }}>
-          Ocean Data Visualisation
-        </div>
+      {/* ⭐ Logo —— 可点击, 从下方展开项目简介 popover.
+          外层 div 加 position:relative, 让 AboutPopover 相对它定位. */}
+      <div style={{ position: "relative", flexShrink: 0 }} ref={aboutBtnRef}>
+        <button
+          onClick={() => setAboutOpen(o => !o)}
+          onMouseEnter={() => setLogoHover(true)}
+          onMouseLeave={() => setLogoHover(false)}
+          style={{
+            display: "flex", alignItems: "center", gap: 10,
+            border: "none",
+            background: (logoHover || aboutOpen) ? theme.bgHover : "transparent",
+            padding: "4px 8px",
+            marginLeft: -8,           // 抵消 padding, 视觉位置不变
+            borderRadius: theme.radiusS,
+            cursor: "pointer",
+            fontFamily: "inherit",
+            transition: "background 150ms",
+          }}
+          title="About this project"
+        >
+          <div style={{
+            width: 28, height: 28, borderRadius: "50%",
+            border: `1.5px solid ${theme.accent}`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            flexShrink: 0,
+          }}>
+            <Waves size={14} color={theme.accent} strokeWidth={2} />
+          </div>
+          <div style={{
+            fontSize: theme.fsSmall,
+            color: (logoHover || aboutOpen) ? theme.text : theme.textMuted,
+            fontWeight: theme.fwMedium,
+            transition: "color 150ms",
+          }}>
+            Ocean-Atmosphere Data Visualisation
+          </div>
+        </button>
+        
+        {aboutOpen && <AboutPopover />}
       </div>
       
       {/* ⭐ 数据源切换按钮 */}

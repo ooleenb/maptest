@@ -88,12 +88,26 @@ export function decodeScalarBuffer(arrayBuffer, shape) {
  *   B = mask * 255   (1=有效海洋, 0=陆地/无效)
  *   A = 255 (不用)
  * 
+ * ⭐ 重要设计 (修复 WRF 陆地无风的 bug):
+ *   decoder 始终保留 R/G 通道解码出的"真实 u/v 值", 不再因为
+ *   B===0 就把 u/v 抹成 NaN. mask 数组单独保留 0/1 信息.
+ *   
+ *   为什么:
+ *   - ROMS (海洋): 陆地格子 PNG 里 R/G 编码的是占位值, 但 mask=0.
+ *     particles.js 海洋模式靠 mask 检查杀死上岸粒子, 不靠 NaN.
+ *   - WRF (大气): 陆地格子 PNG 里 R/G 编码的是【真实风速】(WRF 陆地
+ *     有风), 只是 mask=0 (mask 来自 ROMS 风格的 land mask).
+ *     如果这里把 u/v 抹成 NaN, 真实风速就丢了, 风粒子无法上陆地.
+ *   
+ *   把"要不要理会 mask"的决定权交给下游 (particles.js 按 kind 区分):
+ *   decoder 只负责忠实解码, 不做业务判断.
+ * 
  * @param {string} url  PNG URL
  * @param {number} uvRange  归一化范围 (从 meta.json 拿)
  * @returns {Promise<{
  *   u: Float32Array,       // 解码后的真实 u 值 (m/s), 长度 = nEta*nXi
  *   v: Float32Array,       // 解码后的真实 v 值 (m/s)
- *   mask: Uint8Array,      // 1=有效, 0=无效
+ *   mask: Uint8Array,      // 1=有效(海洋), 0=陆地. u/v 本身始终是有效数值.
  *   nEta: number,
  *   nXi: number,
  * }>}
@@ -128,6 +142,8 @@ export function decodeUVPng(url, uvRange) {
         const mask = new Uint8Array(n);
         
         // 解码: 反归一化
+        // ⭐ 始终解码 R/G 出真实 u/v, 不再因 B===0 抹成 NaN.
+        //    mask 单独记录 0/1, 由下游决定是否理会.
         const scale = (2 * uvRange) / 255;
         for (let i = 0; i < n; i++) {
           const idx4 = i * 4;
@@ -135,17 +151,12 @@ export function decodeUVPng(url, uvRange) {
           const g = rgba[idx4 + 1];
           const b = rgba[idx4 + 2];
           
-          if (b > 127) {
-            // 有效像素
-            u[i] = r * scale - uvRange;
-            v[i] = g * scale - uvRange;
-            mask[i] = 1;
-          } else {
-            // 无效像素, 用 NaN 标记 (前端绘图时跳过)
-            u[i] = NaN;
-            v[i] = NaN;
-            mask[i] = 0;
-          }
+          // R/G 通道始终解码出数值 (海洋格子是真实流速,
+          // ROMS 陆地格子是占位值, WRF 陆地格子是真实风速)
+          u[i] = r * scale - uvRange;
+          v[i] = g * scale - uvRange;
+          // mask: B 通道 > 127 表示"海洋有效格子"
+          mask[i] = (b > 127) ? 1 : 0;
         }
         
         if (DEBUG) {
