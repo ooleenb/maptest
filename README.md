@@ -34,7 +34,7 @@ docker-compose down
 
 - **Two ROMS data sources**, switchable from a single UI:
   - **Perth waters** — 500 m local model, 259×129 grid
-  - **Central WA** — ~2 km regional model, 640×480 grid (full WA shelf)
+  - **Central WA** — ~2 km regional model, 640×480 grid
 - **Surface variables**: temperature, salinity, sea-surface height
 - **Surface currents** rendered as animated particle trails
 - **Time control**: 24-hour playback per day, scrubbable timeline, variable playback speed (0.5×–6×)
@@ -104,7 +104,7 @@ MapTest/
 
 ---
 
-## API reference
+<!-- ## API reference
 
 Base URL: `http://localhost:8000/api` (direct) or `http://localhost:8081/api` (via Nginx).
 
@@ -152,7 +152,7 @@ The backend reads two optional environment variables:
 - `ROMS_GRID_CACHE_DIR` — where to cache grid files (default `/app/data/grid` in Docker)
 - `ROMS_DATA_ROOT` — where to write prepared day data (default `/app/data/frames`)
 
----
+--- -->
 
 ## Development mode (without Docker)
 
@@ -224,8 +224,3 @@ The original project brief proposed a Java-based system built on [Kalisio Kano +
 - THREDDS data server hosting at `boreas.mywire.org:8080`
 - Basemap tiles by [CARTO](https://carto.com/) and [OpenStreetMap](https://www.openstreetmap.org/) contributors
 
-<!-- --- -->
-
-<!-- ## License
-
-To be added. -->
