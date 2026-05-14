@@ -1,10 +1,3 @@
-/**
- * App.jsx (Step 3.4 + CWA integration)
- * ====================================
- * 
- * 全新布局: windy.com 风格 + 数据源切换。
- */
-
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Map } from "react-map-gl/maplibre";
 import { DeckGL } from "@deck.gl/react";
@@ -43,7 +36,7 @@ const SLOW_LOAD_THRESHOLD_MS = 2000;
 const MAX_HOUR = 23;
 
 
-// ⭐ CARTO Voyager: 比 OSM 更克制的彩色底图
+// CARTO Voyager: 比 OSM 更克制的彩色底图
 //    - 道路浅灰、绿地淡黄绿、字体小而清晰
 //    - 完全免费, 无 API key
 //    - 4 个 subdomain (a-d) 用于并行下载, 比单个 OSM 服务器快很多
@@ -122,9 +115,7 @@ export default function App() {
   const lastCommitTimeRef = useRef(0);
   
   
-  // ============================================================
-  // ⭐ 数据源切换处理
-  // ============================================================
+
   const handleSourceChange = (newSource) => {
     if (newSource === source) return;
     
@@ -137,7 +128,7 @@ export default function App() {
     setPickedPoint(null);
     setPopupScreenPos(null);
     
-    // ⭐ 粒子彻底重置
+
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
@@ -147,7 +138,7 @@ export default function App() {
     simulatorRef.current = null;
     setSimulatorReadyToken(t => t + 1);
     
-    // ⭐ 调整粒子数到新源的合理默认 (CWA 800, Perth 1400)
+
     setParticleCount(newSource === "cwa" ? 800 : 1400);
     
     // 切日期到 fallback (datesIndex 加载完会自动跳到最新一天)
@@ -163,9 +154,7 @@ export default function App() {
   };
   
   
-  // ============================================================
-  // 切变量时自动应用推荐 colormap
-  // ============================================================
+
   useEffect(() => {
     if (DEFAULT_COLORMAP[variable]) {
       setColormapKey(DEFAULT_COLORMAP[variable]);
@@ -173,9 +162,7 @@ export default function App() {
   }, [variable]);
   
   
-  // ============================================================
-  // 启动 / 切源时: 加载 grid + 日期列表
-  // ============================================================
+
   useEffect(() => {
     let cancelled = false;
     async function loadInitial() {
@@ -201,7 +188,7 @@ export default function App() {
   }, [source]);
   
   
-  // ⭐ datesIndex 到位时, 自动跳到 remote 列表里的"最新一天"。
+
   useEffect(() => {
     if (autoPickedRef.current) return;
     if (!datesIndex?.remote?.length) return;
@@ -249,7 +236,7 @@ export default function App() {
   }, [grid]);
   
   
-  // ⭐ CWA 性能优化: 大网格 (282K cells) 不做小时间插值
+
   const effectiveHour = source === "cwa" ? Math.floor(hourFloat) : hourFloat;
   
   const coloredCells = useMemo(() => {
@@ -288,7 +275,7 @@ export default function App() {
   }, [grid, day, effectiveHour, opacity, variable, colormapKey, rangeMode]);
   
   
-  // ⭐ 每个数据源用合适的拖尾长度
+
   const trailLengthForSource = source === "cwa" ? 60 : 40;
   
   useEffect(() => {

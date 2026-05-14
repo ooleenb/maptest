@@ -1,24 +1,4 @@
-"""
-data_loader.py
-==============
-
-统一的 OPeNDAP / NetCDF 数据访问层。
-
-设计思路:
----------
-- 所有与"取数据"相关的逻辑集中在这一个文件里
-- 上层代码 (prep_day.py / api.py) 不需要关心 OPeNDAP URL、变量名、时间索引等细节
-- 支持两种访问模式:
-    "aggregated": 一个 ncml URL 提供整年数据 (Perth/CWA ROMS)
-    "per_day":    每天一个单独的 .nc 文件 (WRF)
-- 不同数据源的实际变量名可能不同 (例如 ROMS 是 temp_sur, WRF 是 Tair),
-  通过 var_map 配置统一映射, 上层代码看到的永远是 temp/salt/zeta/u/v
-
-依赖:
------
-    pip install xarray netCDF4 dask numpy
-"""
-
+#data_loader.py
 from __future__ import annotations
 
 import logging
@@ -31,9 +11,7 @@ import numpy as np
 import xarray as xr
 
 
-# ============================================================
-# 日志配置
-# ============================================================
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -44,15 +22,7 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-# ============================================================
-# 数据源配置
-# ============================================================
-# 每个源用统一的接口暴露 (temp/salt/zeta/u/v + time_dim),
-# 通过 var_map 把内部统一名映射到该数据集真实的变量名。
-#
-# access_mode 决定怎么打开数据:
-#   "aggregated": 用 ncml_url, 一个句柄管所有日期 (适合 Perth/CWA)
-#   "per_day":    用 day_url_pattern.format(ymd="20260516") 按需打开单天文件 (适合 WRF)
+
 DATA_SOURCES = {
     "perth": {
         "name": "Perth waters 500m ROMS",
@@ -100,12 +70,7 @@ DATA_SOURCES = {
         "date_range_end":   "2026-05-17",
         "resolution_m": 2000,  # WRF d02 大约 2km
         "time_dim": "time",     # WRF 用 'time', ROMS 用 'ocean_time'
-        # ⭐ WRF 是大气模型, 把大气变量"伪装"成 ROMS 的标量名
-        #    这样前端代码完全复用, 用户看到的:
-        #      "temp"  = 气温 (Tair, °C)
-        #      "salt"  = 气压 (Pair, mbar) - 单位完全不同, 但能可视化
-        #      "zeta"  = 湿度 (Qair, %)
-        #      u/v     = 风速分量 (Uwind, Vwind, m/s)
+
         "var_map": {
             "temp": "Tair",
             "salt": "Pair",
@@ -117,9 +82,7 @@ DATA_SOURCES = {
 }
 
 
-# ============================================================
-# 工具函数: numpy datetime64 -> python datetime
-# ============================================================
+
 def np_datetime_to_py(np_time: np.datetime64) -> datetime:
     """
     把 numpy datetime64 (纳秒精度) 转成 python datetime (微秒精度,UTC)。
@@ -128,9 +91,7 @@ def np_datetime_to_py(np_time: np.datetime64) -> datetime:
     return py_dt.replace(tzinfo=timezone.utc)
 
 
-# ============================================================
-# 工具函数: 哨兵值清洗
-# ============================================================
+
 def _sanitize(arr: np.ndarray, threshold: float = 1e30) -> np.ndarray:
     """把数组里的"哨兵值" (例如 1e37) 替换成 NaN。"""
     arr = arr.astype(np.float32, copy=False)
@@ -140,9 +101,7 @@ def _sanitize(arr: np.ndarray, threshold: float = 1e30) -> np.ndarray:
     return arr
 
 
-# ============================================================
-# 工具函数: 日期范围生成
-# ============================================================
+
 def _generate_date_range(start: str, end: str) -> list[str]:
     """生成 [start, end] 之间所有日期的 YYYY-MM-DD 字符串列表。"""
     from datetime import date as date_cls, timedelta

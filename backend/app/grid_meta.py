@@ -1,36 +1,5 @@
 """
 grid_meta.py
-============
-
-ROMS 网格元数据加载与缓存。
-
-为什么独立成一个模块:
---------------------
-- 网格几何信息(经纬度、海陆掩膜、水深、度量因子)不随时间变化
-- 没必要每次取数据时都重复下载
-- 第一次跑时从 OPeNDAP 拉一次,存到本地,以后所有调用都用本地缓存
-- 这样把"慢的网络操作"和"快的本地计算"清晰分开
-
-提供的能力:
-----------
-- get_grid_meta(source_name): 返回某数据源的网格元数据(自动缓存)
-- 内置 mask_rho / h / lon_rho / lat_rho / lon_vert / lat_vert / pm / pn / angle
-- 预计算好的"cell polygons"列表,前端 DeckGL 直接用
-- 推荐的地图初始视图(中心点 + zoom)
-
-使用示例:
----------
-    from grid_meta import get_grid_meta
-    
-    meta = get_grid_meta("perth")
-    print(meta.mask_rho.shape)         # (259, 129)
-    
-    meta_cwa = get_grid_meta("cwa")
-    print(meta_cwa.mask_rho.shape)     # (640, 480)
-
-依赖:
------
-    pip install xarray netCDF4 numpy
 """
 
 from __future__ import annotations
@@ -57,9 +26,7 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-# ============================================================
-# 配置: 数据源对应的 grid 文件
-# ============================================================
+
 GRID_SOURCES = {
     "perth": {
         "url": "http://boreas.mywire.org:8080/thredds/dodsC/perthhis/perth_his_grid.nc",
@@ -75,9 +42,7 @@ GRID_SOURCES = {
 }
 
 
-# ============================================================
-# 缓存路径
-# ============================================================
+
 def _get_cache_dir() -> Path:
     cache = os.environ.get("ROMS_GRID_CACHE_DIR")
     if cache:
@@ -85,9 +50,7 @@ def _get_cache_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "grid"
 
 
-# ============================================================
-# 网格元数据结构
-# ============================================================
+
 @dataclass
 class GridMeta:
     """

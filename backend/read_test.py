@@ -1,5 +1,5 @@
 import xarray as xr
-ds = xr.open_dataset("http://boreas.mywire.org:8080/thredds/dodsC/WRF2026/wrf_roms_d02_20260516.nc")
+ds = xr.open_dataset("http://boreas.mywire.org:8080/thredds/dodsC/perthqck/perth_qck_202601.ncml")
 print(ds)
 print("---")
 for var in ds.data_vars:

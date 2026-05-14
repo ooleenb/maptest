@@ -1,34 +1,5 @@
 """
 prep_day.py
-===========
-
-核心预处理脚本: 给定一个日期,生成前端需要的完整数据包。
-
-输出目录结构:
-    backend/data/frames/<source>/<date>/
-        meta.json           ← 帧时间戳、变量统计、版本信息
-        temp.bin            ← 24 帧温度场 (Float32 二进制)
-        salt.bin            ← 24 帧盐度场
-        zeta.bin            ← 24 帧海面高度
-        uv_00.png ~ uv_23.png  ← 24 帧 u/v 编码图
-
-数据格式设计:
-- 标量场 (temp/salt/zeta) → 裸 Float32 二进制
-  * 浏览器原生支持 (一行 fetch + arrayBuffer + new Float32Array)
-  * 24 帧打包成 1 个文件,减少网络请求
-  * 陆地点存 NaN (前端绘图时跳过)
-- u/v 流场 → PNG (R=u, G=v, B=mask)
-  * GPU 友好: 浏览器解码到纹理是硬件加速
-  * 归一化范围在 meta.json 里,前端解码时还原
-- meta.json: 所有元信息
-
-依赖:
-    pip install xarray netCDF4 dask numpy pillow
-
-用法:
-    python prep_day.py 2026-03-11
-    python prep_day.py 2026-03-11 --source perth
-    python prep_day.py 2026-03-11 --output-dir /path/to/output
 """
 
 from __future__ import annotations
@@ -46,7 +17,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
-# 导入我们前两步写好的模块
+
 from data_loader import ROMSDataSource, FrameData
 from grid_meta import get_grid_meta, GridMeta
 
@@ -61,60 +32,27 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-# ============================================================
-# 输出格式版本
-# ============================================================
-# 当数据格式发生破坏性变化时,bump 这个版本号。
-# 前端可以读 meta.json 的 format_version 检查兼容性。
+
 FORMAT_VERSION = "1.0"
 
 
-# ============================================================
-# u/v PNG 编码范围
-# ============================================================
-# 把 u/v (m/s) 归一化到 0-255 的 byte 值。
-# 范围要覆盖实际数据的 99% 以上,同时留点 headroom。
-# Perth 域典型流速范围 ±1 m/s,极端值 ±2 m/s,这里设到 ±2.5 m/s 留余地。
+
 UV_NORM_RANGE = 2.5  # u/v 的归一化半范围(单位 m/s)
 
 
-# ============================================================
-# 默认输出目录
-# ============================================================
+
 def _default_output_dir() -> Path:
     """默认输出到 backend/data/frames/"""
     return Path(__file__).resolve().parent.parent / "data" / "frames"
 
 
-# ============================================================
-# 标量场打包
-# ============================================================
+
 def _pack_scalar_field(
     frames: list[FrameData],
     var_name: str,
     output_path: Path,
 ) -> dict:
-    """
-    把 24 帧的某个标量场 (temp/salt/zeta) 打包成单个 Float32 二进制文件。
-    
-    数据布局:
-        frame_0_row_0_col_0, frame_0_row_0_col_1, ..., frame_0_row_258_col_128,
-        frame_1_row_0_col_0, ...,
-        ...
-        frame_23_...
-    
-    陆地/无效点保持 NaN (前端绘图时跳过)。
-    
-    参数:
-    -----
-    frames: FrameData 列表
-    var_name: 'temp' / 'salt' / 'zeta'
-    output_path: 输出文件路径
-    
-    返回:
-    -----
-    包含此变量元信息的字典(用于 meta.json)
-    """
+   
     # 用 getattr 动态访问 frame.temp / frame.salt / frame.zeta
     arrays = [getattr(f, var_name) for f in frames]
     
