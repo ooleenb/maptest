@@ -79,12 +79,12 @@ export default function App() {
   // ---- ⭐ 数据源 ----
   const [source, setSource] = useState(DEFAULT_SOURCE);
   const [switchingSource, setSwitchingSource] = useState(false);
-  
+
   // ---- 数据 ----
   const [grid, setGrid] = useState(null);
   const [gridError, setGridError] = useState(null);
   const [datesIndex, setDatesIndex] = useState(null);
-  
+
   const [date, setDate] = useState(FALLBACK_DATE);
   // ⭐ 标记: 当前 source 是否已经"自动跳到最新一天"过
   //         切源时重置为 false, datesIndex 到位后自动跳一次, 之后保留用户选择
@@ -93,14 +93,14 @@ export default function App() {
   const [colormapKey, setColormapKey] = useState(DEFAULT_COLORMAP.temp);
   const [rangeMode, setRangeMode] = useState("global");
   const [opacity, setOpacity] = useState(0.75);
-  
+
   // ---- 播放 ----
   const [playbackSpeed, setPlaybackSpeed] = useState(2);
   const {
     hourFloat, setHourFloat,
     isPlaying, togglePlay, pause,
   } = usePlayback({ initialHour: 0, maxHour: MAX_HOUR, speed: playbackSpeed });
-  
+
   // ---- 粒子 ----
   // CWA 网格大 (282K cells), 仿真 CPU 负担重, 默认粒子数降到 800
   // (Perth 网格小, 1400 粒子也很流畅)
@@ -110,38 +110,38 @@ export default function App() {
   const [particleCount, setParticleCount] = useState(
     DEFAULT_SOURCE === "cwa" ? 800 : 1400
   );
-  
+
   // ---- UI 状态 ----
   const [activeSidebar, setActiveSidebar] = useState(null);
   const [pickedPoint, setPickedPoint] = useState(null);
   const [popupScreenPos, setPopupScreenPos] = useState(null);
   const [showSlowWarning, setShowSlowWarning] = useState(false);
-  
+
   // ---- 粒子动画 ----
   const [particleSegments, setParticleSegments] = useState([]);
   const [particleHeads, setParticleHeads] = useState([]);
   const [simulatorReadyToken, setSimulatorReadyToken] = useState(0);
-  
+
   const mapRef = useRef(null);
   const simulatorRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastFrameTimeRef = useRef(null);
   const lastCommitTimeRef = useRef(0);
-  
-  
+
+
 
   const handleSourceChange = (newSource) => {
     if (newSource === source) return;
-    
+
     console.log(`[App] Switching source: ${source} -> ${newSource}`);
-    
+
     setSwitchingSource(true);
-    
+
     // 暂停播放, 清除采样
     pause();
     setPickedPoint(null);
     setPopupScreenPos(null);
-    
+
 
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -151,10 +151,10 @@ export default function App() {
     setParticleHeads([]);
     simulatorRef.current = null;
     setSimulatorReadyToken(t => t + 1);
-    
+
 
     setParticleCount(newSource === "cwa" ? 800 : 1400);
-    
+
     // ⭐ 切源时检查当前 variable 在新源里是否存在.
     //    ROMS 有 temp/salt/zeta, WRF 有 temp/Pair/Qair/rain/cloud.
     //    如果当前选的变量新源没有 (例如从 Perth 的 salt 切到 WRF),
@@ -165,28 +165,28 @@ export default function App() {
       console.log(`[App] Variable '${variable}' not in ${newSource}, reset to '${fallbackVar}'`);
       setVariable(fallbackVar);
     }
-    
+
     // 切日期到 fallback (datesIndex 加载完会自动跳到最新一天)
     setDate(FALLBACK_DATE);
     autoPickedRef.current = false;
-    
+
     // 重置数据
     setGrid(null);
     setGridError(null);
     setDatesIndex(null);
-    
+
     setSource(newSource);
   };
-  
-  
+
+
 
   useEffect(() => {
     if (DEFAULT_COLORMAP[variable]) {
       setColormapKey(DEFAULT_COLORMAP[variable]);
     }
   }, [variable]);
-  
-  
+
+
 
   useEffect(() => {
     let cancelled = false;
@@ -211,24 +211,24 @@ export default function App() {
     loadInitial();
     return () => { cancelled = true; };
   }, [source]);
-  
-  
+
+
 
   useEffect(() => {
     if (autoPickedRef.current) return;
     if (!datesIndex?.remote?.length) return;
-    
+
     const latest = datesIndex.remote[datesIndex.remote.length - 1];
     console.log(`[App] Auto-picking latest date for ${source}: ${latest}`);
     setDate(latest);
     autoPickedRef.current = true;
   }, [datesIndex, source]);
-  
-  
+
+
   const dayState = useDayData(grid ? source : null, date);
   const day = dayState.data;
-  
-  
+
+
   useEffect(() => {
     if (!dayState.loading) {
       setShowSlowWarning(false);
@@ -237,8 +237,8 @@ export default function App() {
     const timer = setTimeout(() => setShowSlowWarning(true), SLOW_LOAD_THRESHOLD_MS);
     return () => clearTimeout(timer);
   }, [dayState.loading]);
-  
-  
+
+
   useEffect(() => {
     if (!grid || !mapRef.current) return;
     const map = mapRef.current.getMap?.();
@@ -259,14 +259,14 @@ export default function App() {
       }
     );
   }, [grid]);
-  
-  
+
+
 
   const effectiveHour = source === "cwa" ? Math.floor(hourFloat) : hourFloat;
-  
+
   const coloredCells = useMemo(() => {
     if (!grid || !day) return null;
-    
+
     // ⭐ 防御: 切源瞬间 source 已变但 day 还是旧数据,
     //    此时 day.scalars[variable] 可能 undefined (例如旧 day 是 ROMS,
     //    variable 已重置成 WRF 的某个变量). 等新 day 加载完会重新进来.
@@ -279,9 +279,33 @@ export default function App() {
       console.log(`[App] grid/day shape mismatch: skipping render`);
       return null;
     }
-    
+
     const frameData = interpolateFrame(scalar, effectiveHour);
-    
+
+    // let colorMin, colorMax;
+    // if (rangeMode === "global") {
+    //   const range = day.ranges[variable];
+    //   // 防御: range 也可能在切换瞬间缺失
+    //   if (!range) {
+    //     return null;
+    //   }
+    //   // ⭐ rain (降雨) 特殊处理:
+    //   //   降雨是"稀疏"数据 —— 绝大部分格子是 0, 只有零星格子有值.
+    //   //   用 p01~p99 的话, p99 ≈ 0 (因为 99% 是 0), 有雨的格子会全部
+    //   //   被 clip 到色带最右端, 色场失去层次.
+    //   //   改用 0 ~ global_max, 让有雨格子能正常映射到色带.
+    //   if (variable === "rain") {
+    //     colorMin = 0;
+    //     colorMax = range.max > 0 ? range.max : 1;  // 防止全 0 那天 max=0 除零
+    //   } else {
+    //     colorMin = range.p01;
+    //     colorMax = range.p99;
+    //   }
+    // } else {
+    //   const mm = computeFrameMinMax(frameData);
+    //   colorMin = mm.min;
+    //   colorMax = mm.max;
+    // }
     let colorMin, colorMax;
     if (rangeMode === "global") {
       const range = day.ranges[variable];
@@ -294,9 +318,18 @@ export default function App() {
       //   用 p01~p99 的话, p99 ≈ 0 (因为 99% 是 0), 有雨的格子会全部
       //   被 clip 到色带最右端, 色场失去层次.
       //   改用 0 ~ global_max, 让有雨格子能正常映射到色带.
+      //
+      // ⭐ cloud (云量) 特殊处理:
+      //   cloud 不稀疏 (p1-p99 是合理的), 但 cloud 是百分比 (0-100), 有
+      //   天然上限. 如果当天云稀少 (例如 p99 = 5%), 用 p1-p99 范围
+      //   colormap 会把 5% 当作 "最满云", 颜色满地都是 —— 误导观感.
+      //   固定 0~100 范围更直观: 真的没云就显示透明, 真的满天云才显示深灰.
       if (variable === "rain") {
         colorMin = 0;
-        colorMax = range.max > 0 ? range.max : 1;  // 防止全 0 那天 max=0 除零
+        colorMax = range.max > 0 ? range.max : 1;
+      } else if (variable === "cloud") {
+        colorMin = 0;
+        colorMax = 100;
       } else {
         colorMin = range.p01;
         colorMax = range.p99;
@@ -306,10 +339,12 @@ export default function App() {
       colorMin = mm.min;
       colorMax = mm.max;
     }
-    
+
+
+
     const cmap = COLORMAPS[colormapKey] ?? COLORMAPS[DEFAULT_COLORMAP[variable]];
     const alpha = Math.round(255 * opacity);
-    
+
     return {
       cells: buildColoredCells(
         grid.oceanCells, frameData, grid.nXi,
@@ -318,11 +353,11 @@ export default function App() {
       colorMin, colorMax, cmap, frameData,
     };
   }, [grid, day, effectiveHour, opacity, variable, colormapKey, rangeMode]);
-  
-  
+
+
 
   const trailLengthForSource = source === "cwa" ? 60 : 40;
-  
+
   useEffect(() => {
     if (!grid || !day) {
       simulatorRef.current = null;
@@ -346,21 +381,21 @@ export default function App() {
     setSimulatorReadyToken(t => t + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [grid, day]);
-  
-  
+
+
   useEffect(() => {
     if (!simulatorRef.current || !day) return;
     const hourInt = Math.min(Math.floor(hourFloat), day.uv.length - 1);
     const uvFrame = day.uv[hourInt];
     if (uvFrame) simulatorRef.current.updateUVFrame(uvFrame);
   }, [hourFloat, day]);
-  
+
   useEffect(() => {
     if (!simulatorRef.current) return;
     simulatorRef.current.setParticleCount(particleCount);
   }, [particleCount]);
-  
-  
+
+
   useEffect(() => {
     if (!particlesEnabled || !simulatorRef.current) {
       setParticleSegments([]);
@@ -397,8 +432,8 @@ export default function App() {
       lastFrameTimeRef.current = null;
     };
   }, [particlesEnabled, particleOpacity, particleSpeed, simulatorReadyToken]);
-  
-  
+
+
   const layers = useMemo(() => {
     const result = [];
     if (coloredCells) {
@@ -437,9 +472,9 @@ export default function App() {
     }
     return result;
   }, [coloredCells, variable, source, date, hourFloat, opacity, colormapKey, rangeMode,
-      particlesEnabled, particleSegments, particleHeads]);
-  
-  
+    particlesEnabled, particleSegments, particleHeads]);
+
+
   const handleDeckClick = (info) => {
     if (!info?.coordinate || !grid || !coloredCells) return;
     const [lon, lat] = info.coordinate;
@@ -453,7 +488,7 @@ export default function App() {
     }
     setPickedPoint({ lon, lat, value });
   };
-  
+
   useEffect(() => {
     if (!pickedPoint || !mapRef.current) return;
     const map = mapRef.current.getMap?.();
@@ -471,27 +506,27 @@ export default function App() {
       map.off("resize", update);
     };
   }, [pickedPoint]);
-  
+
   useEffect(() => {
     setPickedPoint(null);
     setPopupScreenPos(null);
   }, [date, variable, source]);
-  
+
   useEffect(() => {
     if (dayState.loading) pause();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dayState.loading]);
-  
-  
+
+
   // ============================================================
   // 渲染
   // ============================================================
   const initialViewState = grid?.suggestedView ?? {
     longitude: 115.56, latitude: -32.07, zoom: 7,
   };
-  
+
   const showFullScreenOverlay = (!day && !gridError && !dayState.error) || gridError;
-  
+
   return (
     <div style={{
       width: "100vw", height: "100vh",
@@ -506,7 +541,7 @@ export default function App() {
       >
         <Map ref={mapRef} mapStyle={mapStyle} reuseMaps />
       </DeckGL>
-      
+
       <TopBar
         source={source}
         onSourceChange={handleSourceChange}
@@ -517,14 +552,14 @@ export default function App() {
         onDateChange={setDate}
         switchingDate={dayState.loading}
       />
-      
+
       {day && (
         <IconSidebar
           activeKey={activeSidebar}
           setActiveKey={setActiveSidebar}
         />
       )}
-      
+
       {day && activeSidebar === "variable" && (
         <VariablePopover
           source={source}
@@ -559,7 +594,7 @@ export default function App() {
           setOpacity={setOpacity}
         />
       )}
-      
+
       {day && (
         <BottomTimebar
           hourFloat={hourFloat}
@@ -572,7 +607,7 @@ export default function App() {
           setPlaybackSpeed={setPlaybackSpeed}
         />
       )}
-      
+
       {coloredCells && (
         <ColorbarLegend
           variable={variable}
@@ -583,14 +618,14 @@ export default function App() {
           rangeMode={rangeMode}
         />
       )}
-      
+
       {particlesEnabled && coloredCells && (
         <ParticleLegend
           bottomOffset={110}
           kind={resolveSourceKind(source, day)}
         />
       )}
-      
+
       {pickedPoint && popupScreenPos && day && (
         <PointPopup
           point={pickedPoint}
@@ -600,18 +635,18 @@ export default function App() {
           onClose={() => { setPickedPoint(null); setPopupScreenPos(null); }}
         />
       )}
-      
+
       <LoadingOverlay
         visible={showFullScreenOverlay && !gridError}
         stage={
           gridError ? "Grid load failed" :
-          !grid ? (switchingSource ? `Loading ${source} grid...` : "Loading grid metadata...") :
-          dayState.stage || "Starting..."
+            !grid ? (switchingSource ? `Loading ${source} grid...` : "Loading grid metadata...") :
+              dayState.stage || "Starting..."
         }
         progress={!grid ? 0.1 : dayState.progress}
         error={gridError}
       />
-      
+
       <TopProgressBar
         visible={dayState.loading && !!day}
         progress={dayState.progress}

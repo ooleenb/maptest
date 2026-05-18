@@ -18,8 +18,6 @@ const VAR_TITLES = {
   salt: "Salinity",
   zeta: "Sea level",
   // --- WRF 大气 ---
-  // 注: temp 在大气源里其实是气温, 但 key 共用 "temp", 这里统一显示
-  //     "Temperature" 也说得通 (气温也是温度). 单位 °C 一致.
   Pair: "Pressure",
   Qair: "Humidity",
   rain: "Rainfall",
@@ -78,9 +76,18 @@ export default function ColorbarLegend({
         </div>
       </div>
       
+      {/* ⭐ colorbar 本身. 双层 background:
+          - 顶层 (cssGradient) 可能含 alpha (如 rainWindy / cloudWhite 的低值段)
+          - 底层 (浅灰白) 模拟地图底图色, 让透明段显示成"浅色"而不是
+            "卡片深色透出来" —— 跟用户在地图上看到的实际效果一致.
+          
+          CSS multiple backgrounds 语法: 越前面的越在上面. */}
       <div style={{
         height: 10, borderRadius: 999,
-        background: cssGradient,
+        background: `
+          ${cssGradient},
+          linear-gradient(to right, rgba(245, 248, 250, 0.9), rgba(245, 248, 250, 0.9))
+        `,
         boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.06)",
       }}/>
       

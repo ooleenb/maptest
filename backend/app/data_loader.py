@@ -53,6 +53,12 @@ if not logger.handlers:
 # access_mode 决定怎么打开数据:
 #   "aggregated": 用 ncml_url, 一个句柄管所有日期 (适合 Perth/CWA)
 #   "per_day":    用 day_url_pattern.format(ymd="20260516") 按需打开单天文件 (适合 WRF)
+#
+# var_map.scales (可选): {规范名: 系数} —— 在 _build_frames 里乘到原始值上.
+#   用途: 把源单位换算到展示单位.
+#   WRF 例子: rain 是 kg/(m²·s), 乘 3600 -> mm/h (常用气象单位)
+#            cloud 是 0-1 fraction, 乘 100 -> 百分比 (跟 GFS / Windy 一致)
+#   没列出的变量默认 ×1 (即不变换).
 DATA_SOURCES = {
     "perth": {
         "name": "Perth waters 500m ROMS",
@@ -100,26 +106,46 @@ DATA_SOURCES = {
     #   - 全域有效 (陆地+海洋都有值, 不像 ROMS 仅海洋)
     #   - 标量变量比 ROMS 多: 气温/气压/湿度/降雨/云量
     #   - 变量挂在多个 time 坐标上 (time/wind_time/tair_time...), 值都相同
+    #
+    # ⭐ 单位换算 (scales):
+    #   - rain:  kg/(m²·s) × 3600 -> mm/h  (源数据是瞬时雨强 rate)
+    #   - cloud: 0-1 fraction × 100 -> %   (转百分比, 跟 GFS / Windy 习惯一致)
+    #
+    # ⭐ 可用日期发现 (catalog_url + file_regex):
+    #   list_available_dates 会请求 THREDDS catalog.xml, 用正则提取
+    #   wrf_roms_d??_YYYYMMDD.nc 里的日期. 这样无需任何硬编码上限,
+    #   预报模型扩展到 +N 天前端自动跟进.
+    #   date_range_end 仅作为网络失败时的兜底.
     "wrf_d01": {
         "name": "Western Australia WRF (atmosphere)",
         "kind": "atmosphere",
         "access_mode": "per_day",
         "day_url_pattern": "http://boreas.mywire.org:8080/thredds/dodsC/WRF2026/wrf_roms_d01_{ymd}.nc",
+        # ⭐ 实时探测可用文件: catalog XML + 用正则匹配自己的文件名
+        "catalog_url":  "http://boreas.mywire.org:8080/thredds/catalog/WRF2026/catalog.xml",
+        "file_regex":   r"wrf_roms_d01_(\d{8})\.nc",
         "date_range_start": "2026-01-01",
+        # date_range_end 现在只作为 catalog HTTP 请求失败时的网络兜底,
+        # 不再作为正常运行时的上限. 主路径用 catalog 实时探测.
         "date_range_end":   "2026-05-21",
         "resolution_m": 2000,
         "time_dim": "time",          # WRF 主时间坐标
         "max_frames": 24,            # 25 个点取前 24 (丢弃重复的 24:00)
         "var_map": {
             "scalars": {
-                "temp":  "Tair",     # 2m 气温 (\u00b0C)
+                "temp":  "Tair",     # 2m 气温 (°C)
                 "Pair":  "Pair",     # 海平面气压 (mbar)
                 "Qair":  "Qair",     # 相对湿度 (0-100)
-                "rain":  "rain",     # 降雨率 (kg m-2 s-1)
-                "cloud": "cloud",    # 云量 (0-1)
+                "rain":  "rain",     # 降雨率 (源 kg/m²/s, 经 scale -> mm/h)
+                "cloud": "cloud",    # 云量 (源 0-1, 经 scale -> %)
             },
             "u": "Uwind",            # 10m 东向风 (m/s)
             "v": "Vwind",            # 10m 北向风 (m/s)
+            # ⭐ 单位换算系数. 没列出的变量默认 1.0 (不变).
+            "scales": {
+                "rain":  3600.0,     # kg/(m²·s) -> mm/h
+                "cloud": 100.0,      # fraction -> %
+            },
         },
     },
     "wrf_d02": {
@@ -127,6 +153,8 @@ DATA_SOURCES = {
         "kind": "atmosphere",
         "access_mode": "per_day",
         "day_url_pattern": "http://boreas.mywire.org:8080/thredds/dodsC/WRF2026/wrf_roms_d02_{ymd}.nc",
+        "catalog_url":  "http://boreas.mywire.org:8080/thredds/catalog/WRF2026/catalog.xml",
+        "file_regex":   r"wrf_roms_d02_(\d{8})\.nc",
         "date_range_start": "2026-01-01",
         "date_range_end":   "2026-05-21",
         "resolution_m": 2000,
@@ -142,6 +170,10 @@ DATA_SOURCES = {
             },
             "u": "Uwind",
             "v": "Vwind",
+            "scales": {
+                "rain":  3600.0,
+                "cloud": 100.0,
+            },
         },
     },
 }
@@ -171,6 +203,23 @@ def _sanitize(arr: np.ndarray, threshold: float = 1e30) -> np.ndarray:
 
 
 # ============================================================
+# 工具函数: 应用单位换算系数
+# ============================================================
+def _apply_scale(arr: np.ndarray, scale: float) -> np.ndarray:
+    """乘上 scale 系数, 用于把源单位换算到展示单位.
+    
+    NaN 保持 NaN (numpy 自动处理). dtype 保持 float32.
+    
+    例:
+      WRF rain (kg/m²/s) * 3600 -> mm/h
+      WRF cloud (0-1 fraction) * 100 -> 百分比
+    """
+    if scale == 1.0:
+        return arr
+    return (arr * scale).astype(np.float32, copy=False)
+
+
+# ============================================================
 # 工具函数: 日期范围生成
 # ============================================================
 def _generate_date_range(start: str, end: str) -> list[str]:
@@ -183,6 +232,89 @@ def _generate_date_range(start: str, end: str) -> list[str]:
     while cur <= ed:
         dates.append(cur.isoformat())
         cur += timedelta(days=1)
+    return dates
+
+
+# ============================================================
+# 工具函数: 解析 THREDDS catalog.xml 拿到真实可用日期
+# ============================================================
+# 缓存机制: 同一个 catalog_url 在 _CATALOG_CACHE_TTL 秒内复用,
+# 避免每次列日期都打 HTTP. 但 TTL 不要设太长 - 服务器新文件
+# 出来要能及时被发现.
+import re as _re
+_CATALOG_CACHE: dict[str, tuple[float, list[str]]] = {}  # url -> (cached_at, dates)
+_CATALOG_CACHE_TTL: float = 600.0  # 10 分钟
+
+
+def _fetch_catalog_dates(
+    catalog_url: str,
+    file_regex: str,
+    force_refresh: bool = False,
+) -> list[str]:
+    r"""请求 THREDDS catalog.xml, 用正则提取文件名里的 YYYYMMDD, 返回排序去重的日期列表 (YYYY-MM-DD).
+    
+    Args:
+        catalog_url: catalog.xml 的完整 URL
+        file_regex:  匹配文件名的正则, 必须有一个捕获组捕获 YYYYMMDD
+                     (e.g. r"wrf_roms_d01_(\d{8})\.nc")
+        force_refresh: 跳过缓存
+    
+    Returns:
+        日期列表 ['2026-01-01', '2026-01-02', ...]
+    
+    Raises:
+        Exception: 网络错误 / XML 异常 / 无匹配文件等. 上层应捕获并 fallback.
+    """
+    # 缓存命中
+    cache_key = f"{catalog_url}|{file_regex}"
+    now = time.time()
+    if not force_refresh and cache_key in _CATALOG_CACHE:
+        cached_at, cached_dates = _CATALOG_CACHE[cache_key]
+        if now - cached_at < _CATALOG_CACHE_TTL:
+            logger.debug(f"catalog cache hit ({now - cached_at:.0f}s old, {len(cached_dates)} dates)")
+            return cached_dates
+    
+    # 缓存未命中: 拉 catalog
+    logger.info(f"Fetching catalog: {catalog_url}")
+    t0 = time.time()
+    
+    # 用 urllib 而非 requests, 避免额外依赖 (xarray 已经依赖, 但显式更稳)
+    import urllib.request
+    with urllib.request.urlopen(catalog_url, timeout=10) as resp:
+        xml_bytes = resp.read()
+    
+    elapsed = time.time() - t0
+    
+    # 正则提取 — 不用真正的 XML parser, catalog 很大但我们只关心文件名,
+    # 正则直接扫文本比建 DOM 快得多, 也更宽容 namespace 等细节.
+    xml_text = xml_bytes.decode("utf-8", errors="replace")
+    pattern = _re.compile(file_regex)
+    
+    ymd_set = set()
+    for match in pattern.finditer(xml_text):
+        ymd = match.group(1)
+        # 验证 ymd 格式合法 (8 位数字, 解析为日期不出错)
+        try:
+            from datetime import date as date_cls
+            d = date_cls(int(ymd[0:4]), int(ymd[4:6]), int(ymd[6:8]))
+            ymd_set.add(d.isoformat())
+        except (ValueError, IndexError):
+            logger.warning(f"  Invalid YMD in filename: {ymd!r}, skipping")
+    
+    dates = sorted(ymd_set)
+    
+    if not dates:
+        raise RuntimeError(
+            f"Catalog at {catalog_url} contained no files matching {file_regex!r}"
+        )
+    
+    logger.info(
+        f"  Got {len(dates)} dates from catalog in {elapsed:.1f}s "
+        f"(first={dates[0]}, last={dates[-1]})"
+    )
+    
+    # 存缓存
+    _CATALOG_CACHE[cache_key] = (now, dates)
     return dates
 
 
@@ -386,21 +518,64 @@ class ROMSDataSource:
         
         Args:
             force_refresh: 若 True, 重新连 OPeNDAP 拿最新时间维度
-                          (用于前端请求"最新可用日期"的情况)
+                          (aggregated), 或重新拉 catalog (per_day).
+                          用于前端请求"最新可用日期"的情况.
+        
+        per_day 模式说明:
+        ----------------
+        从 THREDDS catalog.xml 实时探测真实存在的 .nc 文件 (catalog_url
+        + file_regex 配置). 服务器加新文件就立刻能被发现, 没有任何硬编码
+        上限. 缓存 10 分钟避免每次都打 HTTP.
+        
+        网络失败兜底:
+        - catalog 拉不下来 -> 回退到 [date_range_start, max(today+1, config_end)]
+          确保前端不会完全没日期可选.
         """
         if self.access_mode == "aggregated":
             # 扫 ncml 时间维度
             ds = self._open(force_refresh=force_refresh)
             times = ds[self.config["time_dim"]].values
             return sorted({str(t)[:10] for t in times})
+        
+        # per_day 模式: 实时探测真实文件
+        catalog_url = self.config.get("catalog_url")
+        file_regex = self.config.get("file_regex")
+        
+        if catalog_url and file_regex:
+            try:
+                dates = _fetch_catalog_dates(
+                    catalog_url, file_regex, force_refresh=force_refresh
+                )
+                # catalog 给的可能包含早于 date_range_start 的文件, 过滤一下
+                start = self.config.get("date_range_start")
+                if start:
+                    dates = [d for d in dates if d >= start]
+                return dates
+            except Exception as e:
+                logger.warning(
+                    f"Catalog fetch failed for {self.source_name} "
+                    f"({type(e).__name__}: {e}), falling back to date_range_*"
+                )
+                # 落到下面的 fallback
+        
+        # Fallback: catalog 没配 (老配置兼容) 或 HTTP 失败.
+        # 用 [date_range_start, max(today+1, date_range_end)] —— 至少保证前端
+        # 能看到 today 附近的日期, 不会因一次网络故障完全没日期可选.
+        from datetime import date as date_cls, timedelta
+        today = date_cls.today()
+        target_end = today + timedelta(days=1)
+        
+        config_end_str = self.config.get("date_range_end")
+        if config_end_str:
+            config_end = date_cls.fromisoformat(config_end_str)
+            effective_end = max(target_end, config_end) if config_end > today else target_end
         else:
-            # per_day 模式: 用配置里的日期范围生成
-            # (实际文件可能没全, 但 list 用途主要是给前端日期选择器,
-            # 缺失日期由 _open_day 打开时报错处理)
-            return _generate_date_range(
-                self.config["date_range_start"],
-                self.config["date_range_end"],
-            )
+            effective_end = target_end
+        
+        return _generate_date_range(
+            self.config["date_range_start"],
+            effective_end.isoformat(),
+        )
     
     # ------------------------------------------------------------
     # 公共方法: 取一整天的 24 帧
@@ -499,8 +674,11 @@ class ROMSDataSource:
               "scalars": {"temp": "temp_sur", "salt": "salt_sur", ...},
               "u": "u_sur_eastward",
               "v": "v_sur_northward",
+              "scales": {"rain": 3600.0, "cloud": 100.0},  # ⭐ 可选: 单位换算
             }
         其中 scalars 是 {规范名: 数据集真实变量名} 的映射, 可任意数量.
+        scales 是可选的 {规范名: 倍数} 映射, 在 _sanitize 后乘到值上,
+        用于把源单位换算到展示单位 (e.g. WRF rain kg/(m²·s) × 3600 → mm/h).
         
         WRF 注意事项:
         - WRF 文件有多个 time 坐标 (time / wind_time / tair_time / ...),
@@ -509,6 +687,7 @@ class ROMSDataSource:
           仍然能正确取到第 i 个时间步 (因为所有 time 坐标长度一致、对齐).
         """
         scalar_map = var_map["scalars"]   # {canonical_name: real_name}
+        scales = var_map.get("scales", {})  # 可选; 没列出的变量默认 ×1
         u_real = var_map["u"]
         v_real = var_map["v"]
         
@@ -536,11 +715,15 @@ class ROMSDataSource:
             time_value = time_values[i]
             timestamp = np_datetime_to_py(time_value)
             
-            # 动态构建标量字典: 遍历 scalar_map 把每个变量取出来
-            scalars = {
-                canonical: _sanitize(day_data[real].values[i])
-                for canonical, real in scalar_map.items()
-            }
+            # 动态构建标量字典:
+            # 流程: 取原始 → _sanitize (清哨兵值) → _apply_scale (单位换算).
+            scalars = {}
+            for canonical, real in scalar_map.items():
+                arr = _sanitize(day_data[real].values[i])
+                scale = scales.get(canonical, 1.0)
+                if scale != 1.0:
+                    arr = _apply_scale(arr, scale)
+                scalars[canonical] = arr
             
             frames.append(FrameData(
                 time=timestamp,
@@ -579,6 +762,7 @@ class ROMSDataSource:
         ds = self._open()
         time_dim = self.config["time_dim"]
         var_map = self.config["var_map"]
+        scales = var_map.get("scales", {})  # 单天提取也要应用 scale, 保持一致
         
         t0 = time.time()
         snapshot = ds.isel({time_dim: time_index})
@@ -589,11 +773,14 @@ class ROMSDataSource:
         time_value = snapshot[time_dim].values
         timestamp = np_datetime_to_py(time_value)
         
-        # 动态构建标量字典
-        scalars = {
-            canonical: _sanitize(snapshot[real].values)
-            for canonical, real in var_map["scalars"].items()
-        }
+        # 动态构建标量字典 (含单位换算)
+        scalars = {}
+        for canonical, real in var_map["scalars"].items():
+            arr = _sanitize(snapshot[real].values)
+            scale = scales.get(canonical, 1.0)
+            if scale != 1.0:
+                arr = _apply_scale(arr, scale)
+            scalars[canonical] = arr
         
         return FrameData(
             time=timestamp,
